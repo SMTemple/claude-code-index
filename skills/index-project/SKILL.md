@@ -4,7 +4,7 @@ description: Reindex the current project's code index with a visible progress ba
 user-invocable: true
 disable-model-invocation: true
 argument-hint: [--full]
-allowed-tools: Bash, Read, Edit, TaskOutput
+allowed-tools: Bash, Read, Edit
 ---
 
 # Index Project
@@ -18,19 +18,20 @@ Reindex the current project using the code-index CLI with a real-time progress b
    - If `.code_index` or `/.code_index` is NOT already listed, append `/.code_index` to the `.gitignore`
    - If no `.gitignore` exists, create one with `/.code_index`
 
-2. **ALWAYS run the reindex as a background task** using `run_in_background: true` on the Bash tool call:
+2. Run the reindex CLI script via Bash:
 
 ```
-python "C:/Users/stemp/.claude/tools/code-indexer/reindex_cli.py" $ARGUMENTS
+python "$HOME/.claude/tools/code-indexer/reindex_cli.py" $ARGUMENTS
 ```
 
 - If the user passes `--full` or `full` as an argument, include `--full` in the command
 - Otherwise, run without `--full` for an incremental reindex (only changed files)
-- **This command MUST use `run_in_background: true`** — never run it in the foreground
 
-3. After launching the background task, immediately inform the user that reindexing is running in the background.
-
-4. Use `TaskOutput` with `block: true` to wait for the result, then report the final summary (file counts, chunk counts, symbol types).
+3. The script shows a live progress bar with:
+   - File discovery count
+   - Per-file parsing progress with a visual bar
+   - Embedding progress
+   - Final summary with file counts, chunk counts, and symbol types
 
 ## Usage
 
