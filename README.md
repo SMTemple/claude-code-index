@@ -77,6 +77,18 @@ Merge these entries into your existing settings:
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__code-index__reindex",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'BLOCKED: Do not call mcp__code-index__reindex directly. Run reindex via Bash with run_in_background: true instead.' && exit 1",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|NotebookEdit",
@@ -106,6 +118,14 @@ Merge these entries into your existing settings:
 }
 ```
 
+#### Hook Explanation
+
+| Hook | Purpose |
+|------|---------|
+| **PreToolUse** (`mcp__code-index__reindex`) | Blocks Claude from calling the reindex MCP tool directly. Reindexing must run via Bash with `run_in_background: true` to avoid blocking the conversation. |
+| **PostToolUse** (`Edit\|Write\|NotebookEdit`) | Sets a flag file after any code edit so the next prompt knows a reindex is needed. |
+| **UserPromptSubmit** | Checks the flag file and reminds Claude to run an incremental reindex before code searches. |
+
 ### 5. Add Instructions to `~/.claude/CLAUDE.md`
 
 Add this to your global CLAUDE.md so Claude knows to use the code index:
@@ -134,7 +154,7 @@ Add this to your global CLAUDE.md so Claude knows to use the code index:
 - Reading a file path the user gave you directly
 - The code index is confirmed down/broken/empty after checking `index_status`
 
-**Reindexing**: ALL reindexing — both incremental (`full=false`) and full (`full=true`) — MUST ALWAYS run in a **background Task agent** or via Bash with `run_in_background: true`. NEVER run reindexing in the foreground. Continue working on other tasks in parallel while it runs. If it doesn't complete within a few minutes, flag it to the user and fall back to direct tools.
+**Reindexing**: ALL reindexing — both incremental (`full=false`) and full (`full=true`) — MUST ALWAYS run via Bash with `run_in_background: true`. NEVER call `mcp__code-index__reindex` directly as an MCP tool — it blocks the conversation. A PreToolUse hook enforces this by blocking direct calls. Continue working with Grep/Glob while the reindex runs in the background.
 
 **Background agents**: Always run Explore agents and other research/search Task agents with `run_in_background: true`. Continue working on other tasks in parallel while waiting for results. Only use foreground agents when their output is a hard prerequisite with no other work to do.
 ```
