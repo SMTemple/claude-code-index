@@ -20,13 +20,33 @@ class EmbeddingError(Exception):
     pass
 
 
-def _get_model():
+def _get_model(timeout=None):
+    """Get the singleton model instance.
+
+    Args:
+        timeout: Max seconds to wait for the lock (None = wait forever).
+                 Use a positive value so callers fail fast instead of hanging
+                 when the prewarm thread is still loading the model.
+    """
     global _model, _model_load_failed
     if _model_load_failed:
         raise EmbeddingError(
             "Model loading previously failed. Restart the server to retry."
         )
-    with _model_lock:
+    # Fast path — model already loaded, no lock needed
+    if _model is not None:
+        return _model
+    # Acquire lock with optional timeout so searches don't hang during prewarm
+    if timeout is not None:
+        acquired = _model_lock.acquire(timeout=timeout)
+    else:
+        acquired = _model_lock.acquire()
+    if not acquired:
+        raise EmbeddingError(
+            "Embedding model is still loading (prewarm in progress). "
+            "Try again in a few seconds, or run reindex via Bash to trigger model load."
+        )
+    try:
         if _model is None:
             try:
                 from sentence_transformers import SentenceTransformer
@@ -40,6 +60,8 @@ def _get_model():
             except Exception as e:
                 _model_load_failed = True
                 raise EmbeddingError(f"Failed to load embedding model: {e}")
+    finally:
+        _model_lock.release()
     return _model
 
 
@@ -71,10 +93,15 @@ def _load_model_with_timeout(timeout: int) -> bool:
     return result['success']
 
 
-def embed_text(text: str) -> List[float]:
-    """Embed a single text string. Raises EmbeddingError on failure."""
+def embed_text(text: str, timeout: int = 10) -> List[float]:
+    """Embed a single text string. Raises EmbeddingError on failure.
+
+    Args:
+        timeout: Max seconds to wait for the model lock (prevents hanging
+                 if prewarm is still in progress). Default 10s.
+    """
     try:
-        model = _get_model()
+        model = _get_model(timeout=timeout)
         embedding = model.encode([text], show_progress_bar=False)
         return embedding[0].tolist()
     except EmbeddingError:

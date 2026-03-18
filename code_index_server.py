@@ -19,7 +19,7 @@ sys.path.insert(0, SERVER_DIR)
 PROJECT_ROOT = os.getcwd()
 
 from code_index.indexer import CodeIndexer
-from code_index.embeddings import prewarm_model
+from code_index.embeddings import prewarm_model, EmbeddingError
 
 mcp = FastMCP("code-index")
 indexer = CodeIndexer(PROJECT_ROOT)
@@ -49,6 +49,12 @@ def search_code(query: str, limit: int = 10) -> str:
                 f"```python\n{r['source_code'][:500]}\n```\n"
             )
         return '\n---\n'.join(output)
+    except EmbeddingError as e:
+        return (
+            f"Model not ready: {e}\n\n"
+            "The embedding model is still loading. Fall back to Grep/Glob for now, "
+            "or wait a moment and retry."
+        )
     except Exception as e:
         return f"Search failed: {e}\nTry running `reindex` to rebuild the index."
 
