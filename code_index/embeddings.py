@@ -110,8 +110,15 @@ def embed_text(text: str, timeout: int = 10) -> List[float]:
         raise EmbeddingError(f"Failed to embed text: {e}")
 
 
-def embed_batch(texts: List[str], timeout: int = EMBED_BATCH_TIMEOUT) -> List[List[float]]:
-    """Embed a batch of texts. Raises EmbeddingError on failure or timeout."""
+def embed_batch(texts: List[str], timeout: int = EMBED_BATCH_TIMEOUT,
+                 progress_callback=None, batch_size: int = 64) -> List[List[float]]:
+    """Embed a batch of texts. Raises EmbeddingError on failure or timeout.
+
+    Args:
+        progress_callback: Optional callable(current, total) called after each
+                           internal batch so callers can report progress.
+        batch_size: Number of texts per internal encode call (default 64).
+    """
     if not texts:
         return []
 
@@ -120,8 +127,15 @@ def embed_batch(texts: List[str], timeout: int = EMBED_BATCH_TIMEOUT) -> List[Li
     def _do_embed():
         try:
             model = _get_model()
-            embs = model.encode(texts, show_progress_bar=False, batch_size=64)
-            result['embeddings'] = [e.tolist() for e in embs]
+            all_embs = []
+            total = len(texts)
+            for start in range(0, total, batch_size):
+                chunk = texts[start:start + batch_size]
+                embs = model.encode(chunk, show_progress_bar=False, batch_size=batch_size)
+                all_embs.extend(e.tolist() for e in embs)
+                if progress_callback:
+                    progress_callback(min(start + len(chunk), total), total)
+            result['embeddings'] = all_embs
         except Exception as e:
             result['error'] = e
 

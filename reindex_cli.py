@@ -7,7 +7,9 @@ Usage:
 If project_root is not given, uses CWD.
 """
 
+import json
 import os
+import subprocess
 import sys
 import shutil
 import time
@@ -17,6 +19,50 @@ SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SERVER_DIR)
 
 from code_index.indexer import CodeIndexer
+
+
+# --------------- GUI progress window helpers ---------------
+
+def launch_progress_gui():
+    """Spawn the tkinter progress GUI as a subprocess."""
+    gui_script = os.path.join(SERVER_DIR, 'progress_gui.py')
+    if not os.path.exists(gui_script):
+        return None
+    try:
+        python_exe = sys.executable
+        pythonw = python_exe.replace('python.exe', 'pythonw.exe')
+        if os.path.exists(pythonw):
+            python_exe = pythonw
+        proc = subprocess.Popen(
+            [python_exe, gui_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+        return proc
+    except Exception:
+        return None
+
+
+def send_gui(proc, msg: dict):
+    """Send a JSON progress message to the GUI subprocess."""
+    if proc and proc.stdin and proc.poll() is None:
+        try:
+            proc.stdin.write((json.dumps(msg) + '\n').encode('utf-8'))
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+
+def close_gui(proc, summary: str):
+    """Send done signal and let the GUI auto-close."""
+    if proc and proc.poll() is None:
+        send_gui(proc, {"done": True, "summary": summary})
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
 
 
 def get_terminal_width():
@@ -73,8 +119,14 @@ def print_progress(phase, current, total, detail, state):
     if phase == 'embed':
         if current == 0:
             print(f"\n  Embedding {total} chunks...", end='', flush=True)
+        elif current >= total:
+            bar = render_progress_bar(current, total)
+            line = f"\r  Embed {bar} | {current}/{total} | done"
+            print(line.ljust(term_width - 1), flush=True)
         else:
-            print(f"\r  Embedding {total} chunks... done", flush=True)
+            bar = render_progress_bar(current, total)
+            line = f"\r  Embed {bar} | {current}/{total}"
+            print(line.ljust(term_width - 1), end='', flush=True)
         return
 
     if phase == 'store':
@@ -95,20 +147,35 @@ def print_progress(phase, current, total, detail, state):
 
 def main():
     full = '--full' in sys.argv
+    quiet = '--quiet' in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     project_root = args[0] if args else os.getcwd()
+
+    indexer = CodeIndexer(project_root)
+
+    # Quiet mode: no GUI, no terminal output — used by background hooks
+    if quiet:
+        indexer.force_reindex(full=full)
+        indexer.close()
+        return
 
     mode = 'Full' if full else 'Incremental'
     print(f"\n  Code Index - {mode} Reindex")
     print(f"  Project: {project_root}")
     print(f"  {'=' * 50}")
 
-    indexer = CodeIndexer(project_root)
     state = {}
     start = time.time()
 
+    # Launch the GUI progress window
+    gui_proc = launch_progress_gui()
+
     def callback(phase, current, total, detail):
         print_progress(phase, current, total, detail, state)
+        send_gui(gui_proc, {
+            "phase": phase, "current": current,
+            "total": total, "detail": detail,
+        })
 
     indexer.force_reindex(full=full, progress_callback=callback)
 
@@ -124,6 +191,11 @@ def main():
     for stype, count in status.get('by_type', {}).items():
         print(f"    {stype}: {count}")
     print()
+
+    # Close the GUI with a summary
+    file_count = status.get('total_files', '?')
+    chunk_count = status.get('total_chunks', '?')
+    close_gui(gui_proc, f"Indexed {file_count} files, {chunk_count} chunks in {elapsed:.1f}s")
 
     indexer.close()
 

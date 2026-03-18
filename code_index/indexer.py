@@ -21,10 +21,13 @@ class IndexingError(Exception):
 
 
 class CodeIndexer:
+    LOCK_FILE_NAME = '.reindex.lock'
+
     def __init__(self, project_root: str):
         self.project_root = Path(project_root).resolve()
         self.index_dir = self.project_root / '.code_index'
         self.db_path = str(self.index_dir / 'code_index.db')
+        self.lock_path = str(self.index_dir / self.LOCK_FILE_NAME)
         self._db = None
         self._parser = CodeParser(str(self.project_root))
 
@@ -34,8 +37,45 @@ class CodeIndexer:
             self._db = CodeIndexDB(self.db_path)
         return self._db
 
+    def is_reindex_locked(self):
+        """Check if another process is currently reindexing."""
+        if not os.path.exists(self.lock_path):
+            return False
+        # Stale lock protection: if lock is older than 15 minutes, ignore it
+        try:
+            age = time.time() - os.path.getmtime(self.lock_path)
+            if age > 900:
+                try:
+                    os.remove(self.lock_path)
+                except OSError:
+                    pass
+                return False
+        except OSError:
+            return False
+        return True
+
+    def _acquire_lock(self):
+        """Create a lock file to signal reindex in progress."""
+        os.makedirs(self.index_dir, exist_ok=True)
+        try:
+            with open(self.lock_path, 'w') as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
+
+    def _release_lock(self):
+        """Remove the lock file."""
+        try:
+            os.remove(self.lock_path)
+        except OSError:
+            pass
+
     def ensure_index(self, progress_callback=None):
         """Auto-build if missing, auto-update only truly changed files."""
+        # Skip if another process is already reindexing
+        if self.is_reindex_locked():
+            return
+
         if not os.path.exists(self.db_path):
             self.build_full_index(progress_callback=progress_callback)
             return
@@ -215,9 +255,21 @@ class CodeIndexer:
                 cached = self.db.get_cached_embeddings_batch(text_hashes)
 
                 uncached_indices = [i for i, h in enumerate(text_hashes) if h not in cached]
+                cache_hits = len(all_chunks) - len(uncached_indices)
                 if uncached_indices:
                     uncached_texts = [all_chunks[i]['search_text'] for i in uncached_indices]
-                    new_embeddings = embed_batch(uncached_texts)
+
+                    def _embed_progress(current, total):
+                        if progress_callback:
+                            done = cache_hits + current
+                            progress_callback('embed', done, len(all_chunks),
+                                              f'Embedded {done}/{len(all_chunks)} chunks ({cache_hits} cached)')
+
+                    if progress_callback and cache_hits:
+                        progress_callback('embed', cache_hits, len(all_chunks),
+                                          f'{cache_hits} cached, embedding {len(uncached_indices)} new...')
+
+                    new_embeddings = embed_batch(uncached_texts, progress_callback=_embed_progress)
                     new_pairs = [(text_hashes[i], new_embeddings[j])
                                  for j, i in enumerate(uncached_indices)]
                     self.db.set_cached_embeddings_batch(new_pairs)
@@ -226,7 +278,6 @@ class CodeIndexer:
 
                 embeddings = [cached[h] for h in text_hashes]
 
-                cache_hits = len(all_chunks) - len(uncached_indices)
                 if progress_callback:
                     progress_callback('embed', len(all_chunks), len(all_chunks),
                                       f'Embedding complete ({cache_hits} cached, {len(uncached_indices)} new)')
@@ -263,25 +314,29 @@ class CodeIndexer:
     def force_reindex(self, full: bool = True, progress_callback=None):
         """Force rebuild. If full=True, clears all data and starts fresh.
         If full=False, runs incremental update (only changed files)."""
-        if full:
-            if os.path.exists(self.db_path):
-                try:
-                    # Try to delete the DB file for a clean slate
-                    if self._db:
-                        self._db.close()
-                        self._db = None
-                    os.remove(self.db_path)
-                except (PermissionError, OSError):
-                    # DB is locked by another process (e.g. MCP server) — clear tables instead
+        self._acquire_lock()
+        try:
+            if full:
+                if os.path.exists(self.db_path):
                     try:
-                        self.db.clear_all()
-                    except Exception:
-                        pass
-                if progress_callback:
-                    progress_callback('init', 0, 1, 'Cleared old index')
-            self.build_full_index(progress_callback=progress_callback)
-        else:
-            self.ensure_index(progress_callback=progress_callback)
+                        # Try to delete the DB file for a clean slate
+                        if self._db:
+                            self._db.close()
+                            self._db = None
+                        os.remove(self.db_path)
+                    except (PermissionError, OSError):
+                        # DB is locked by another process (e.g. MCP server) — clear tables instead
+                        try:
+                            self.db.clear_all()
+                        except Exception:
+                            pass
+                    if progress_callback:
+                        progress_callback('init', 0, 1, 'Cleared old index')
+                self.build_full_index(progress_callback=progress_callback)
+            else:
+                self.ensure_index(progress_callback=progress_callback)
+        finally:
+            self._release_lock()
 
     def _incremental_update(self, needs_index, needs_delete, tracking_updates,
                              progress_callback=None):
@@ -334,9 +389,21 @@ class CodeIndexer:
                 cached = self.db.get_cached_embeddings_batch(text_hashes)
 
                 uncached_indices = [i for i, h in enumerate(text_hashes) if h not in cached]
+                cache_hits = len(all_chunks) - len(uncached_indices)
                 if uncached_indices:
                     uncached_texts = [all_chunks[i]['search_text'] for i in uncached_indices]
-                    new_embeddings = embed_batch(uncached_texts)
+
+                    def _embed_progress(current, total):
+                        if progress_callback:
+                            done = cache_hits + current
+                            progress_callback('embed', done, len(all_chunks),
+                                              f'Embedded {done}/{len(all_chunks)} chunks ({cache_hits} cached)')
+
+                    if progress_callback and cache_hits:
+                        progress_callback('embed', cache_hits, len(all_chunks),
+                                          f'{cache_hits} cached, embedding {len(uncached_indices)} new...')
+
+                    new_embeddings = embed_batch(uncached_texts, progress_callback=_embed_progress)
                     new_pairs = [(text_hashes[i], new_embeddings[j])
                                  for j, i in enumerate(uncached_indices)]
                     self.db.set_cached_embeddings_batch(new_pairs)
