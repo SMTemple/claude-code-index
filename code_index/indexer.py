@@ -2,12 +2,16 @@
 
 import os
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 from .database import CodeIndexDB
 from .parser import CodeParser
 from .embeddings import embed_text, embed_batch, EmbeddingError
+
+# In-memory LRU cache for query embeddings to avoid re-computing on repeated searches
+_QUERY_CACHE_MAX = 128
 
 # Per-file parse timeout (seconds)
 FILE_PARSE_TIMEOUT = int(os.environ.get('CODE_INDEX_PARSE_TIMEOUT', 30))
@@ -30,6 +34,7 @@ class CodeIndexer:
         self.lock_path = str(self.index_dir / self.LOCK_FILE_NAME)
         self._db = None
         self._parser = CodeParser(str(self.project_root))
+        self._query_cache = OrderedDict()  # LRU cache: query_text -> embedding
 
     @property
     def db(self):
@@ -436,28 +441,51 @@ class CodeIndexer:
         self.db.set_meta('files_reindexed', str(len(needs_index)))
         self.db.set_meta('files_deleted', str(len(needs_delete)))
 
-    def search_code(self, query: str, limit: int = 10):
+    def _get_query_embedding(self, query: str):
+        """Get embedding for a search query, using in-memory LRU cache."""
+        if query in self._query_cache:
+            self._query_cache.move_to_end(query)
+            return self._query_cache[query]
         try:
-            self.ensure_index()
-            query_vec = embed_text(query)
-            return self.db.search_hybrid(query_vec, query, limit)
+            vec = embed_text(query)
+            self._query_cache[query] = vec
+            if len(self._query_cache) > _QUERY_CACHE_MAX:
+                self._query_cache.popitem(last=False)
+            return vec
+        except EmbeddingError:
+            return None
+
+    def _require_index(self):
+        """Check that the index DB exists. Returns True if ready, False if not."""
+        return os.path.exists(self.db_path)
+
+    def search_code(self, query: str, limit: int = 10):
+        if not self._require_index():
+            return []
+        try:
+            query_vec = self._get_query_embedding(query)
+            if query_vec is not None:
+                return self.db.search_hybrid(query_vec, query, limit)
+            # Embedding unavailable — use text search only
+            return self.db.search_fts(query, limit) or self.db._search_like_fallback(query, limit)
         except EmbeddingError:
             # Vector search unavailable — fall back to text search
-            self.ensure_index()
             return self.db.search_fts(query, limit) or self.db._search_like_fallback(query, limit)
         except Exception:
             return []
 
     def search_symbol(self, name: str, symbol_type: str = None):
+        if not self._require_index():
+            return []
         try:
-            self.ensure_index()
             return self.db.search_by_name(name, symbol_type)
         except Exception:
             return []
 
     def get_file_overview(self, file_path: str):
+        if not self._require_index():
+            return []
         try:
-            self.ensure_index()
             file_path = file_path.replace('\\', '/')
             return self.db.get_file_symbols(file_path)
         except Exception:
