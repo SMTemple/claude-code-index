@@ -146,10 +146,7 @@ def reindex(full: bool = False) -> str:
             progress_log.append(detail)
             phase_summaries[phase] = (current, total)
 
-        if full:
-            indexer.force_reindex(full=True, progress_callback=progress_callback)
-        else:
-            indexer.ensure_index(progress_callback=progress_callback)
+        indexer.force_reindex(full=full, progress_callback=progress_callback)
 
         status = indexer.get_status()
         mode = 'Full' if full else 'Incremental'

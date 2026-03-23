@@ -126,7 +126,7 @@ def embed_batch(texts: List[str], timeout: int = EMBED_BATCH_TIMEOUT,
 
     def _do_embed():
         try:
-            model = _get_model()
+            model = _get_model(timeout=60)
             all_embs = []
             total = len(texts)
             for start in range(0, total, batch_size):

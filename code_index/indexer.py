@@ -43,9 +43,21 @@ class CodeIndexer:
         return self._db
 
     def is_reindex_locked(self):
-        """Check if another process is currently reindexing."""
+        """Check if another process is currently reindexing.
+
+        Returns False if the lock is held by the current process (same PID),
+        so that force_reindex -> ensure_index call chains work correctly.
+        """
         if not os.path.exists(self.lock_path):
             return False
+        # Check if the current process owns this lock
+        try:
+            with open(self.lock_path, 'r') as f:
+                lock_pid = f.read().strip()
+            if lock_pid == str(os.getpid()):
+                return False  # We own this lock — not blocked
+        except (OSError, ValueError):
+            pass
         # Stale lock protection: if lock is older than 15 minutes, ignore it
         try:
             age = time.time() - os.path.getmtime(self.lock_path)
@@ -82,7 +94,12 @@ class CodeIndexer:
             return
 
         if not os.path.exists(self.db_path):
-            self.build_full_index(progress_callback=progress_callback)
+            # Acquire lock to prevent concurrent builds
+            self._acquire_lock()
+            try:
+                self.build_full_index(progress_callback=progress_callback)
+            finally:
+                self._release_lock()
             return
 
         try:
@@ -91,7 +108,11 @@ class CodeIndexer:
             # DB is corrupted or unreadable — rebuild from scratch
             if progress_callback:
                 progress_callback('init', 0, 1, f'DB error ({e}), rebuilding...')
-            self.build_full_index(progress_callback=progress_callback)
+            self._acquire_lock()
+            try:
+                self.build_full_index(progress_callback=progress_callback)
+            finally:
+                self._release_lock()
             return
 
         current_files = {}
@@ -158,8 +179,12 @@ class CodeIndexer:
         needs_delete.extend(deleted)
 
         if needs_index or needs_delete or tracking_updates:
-            self._incremental_update(needs_index, needs_delete, tracking_updates,
-                                     progress_callback=progress_callback)
+            self._acquire_lock()
+            try:
+                self._incremental_update(needs_index, needs_delete, tracking_updates,
+                                         progress_callback=progress_callback)
+            finally:
+                self._release_lock()
 
     def build_full_index(self, progress_callback=None):
         """Build the entire index from scratch with smart filtering."""
@@ -368,20 +393,27 @@ class CodeIndexer:
             except Exception:
                 pass
 
-        # Parse and embed new/changed files
+        # Parse new/changed files with per-file timeout protection
         all_chunks = []
-        for i, fpath in enumerate(needs_index):
-            full_path = self.project_root / fpath
-            if full_path.exists():
-                try:
-                    chunks = self._parser.parse_file(full_path)
-                except Exception:
-                    chunks = []
-                all_chunks.extend(chunks)
-                step += 1
-                if progress_callback:
-                    progress_callback('parse', step, total_steps,
-                                      f'Parsed: {fpath} ({len(chunks)} chunks)')
+        with ThreadPoolExecutor(max_workers=1) as parse_executor:
+            for i, fpath in enumerate(needs_index):
+                full_path = self.project_root / fpath
+                if full_path.exists():
+                    try:
+                        future = parse_executor.submit(self._parser.parse_file, full_path)
+                        chunks = future.result(timeout=FILE_PARSE_TIMEOUT)
+                    except FuturesTimeoutError:
+                        chunks = []
+                        if progress_callback:
+                            progress_callback('parse', step, total_steps,
+                                              f'Timeout: {fpath} (skipped)')
+                    except Exception:
+                        chunks = []
+                    all_chunks.extend(chunks)
+                    step += 1
+                    if progress_callback:
+                        progress_callback('parse', step, total_steps,
+                                          f'Parsed: {fpath} ({len(chunks)} chunks)')
 
         if all_chunks:
             if progress_callback:
