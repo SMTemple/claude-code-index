@@ -7,20 +7,37 @@ import re
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
-# Directories to always skip (matched at any depth)
+# Directories to always skip (exact name match at any depth)
 SKIP_DIRS = {
     '__pycache__', '.git', '.svn', '.hg',
     'venv', '.venv', 'env', '.env',
     'node_modules', 'bower_components',
     '.code_index', '.tox', '.mypy_cache', '.pytest_cache',
-    'dist', 'build', '_build', '.build',
+    'dist', 'build', '_build', '.build', 'out', 'output',
     'site-packages', '_internal',
-    'archives', 'backups',
+    'archives', 'backups', 'logs', 'tmp', '.tmp',
     '.next', '.nuxt', '.output',
     'coverage', '.coverage', 'htmlcov',
     '.terraform', '.serverless',
-    'vendor', '.eggs', '*.egg-info',
+    'vendor', '.eggs',
+    # IDE / editor
+    '.idea', '.vs', '.vscode',
+    # Language-specific build/cache
+    'target', '.cargo', 'obj', 'bin',
+    '.gradle', '.maven',
+    # JS/TS tooling caches
+    '.cache', '.parcel-cache', '.turbo', '.swc',
+    '.yarn', '.pnp', '.angular', '.expo',
+    # Deployment / hosting
+    '.vercel', '.netlify', '.amplify',
+    # Sass / CSS caches
+    '.sass-cache',
+    # WordPress large dirs
+    'uploads', 'wp-content/uploads',
 }
+
+# Directory name suffixes that should also be skipped (e.g. *.egg-info)
+SKIP_DIR_SUFFIXES = ('.egg-info',)
 
 # File extensions to index, grouped by parse strategy
 PYTHON_EXTS = {'.py'}
@@ -96,7 +113,9 @@ class CodeParser:
         """Find all indexable files, skipping vendor/build/venv dirs."""
         found = []
         for root, dirs, files in os.walk(self.project_root):
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            dirs[:] = [d for d in dirs
+                       if d not in SKIP_DIRS
+                       and not d.endswith(SKIP_DIR_SUFFIXES)]
             for f in files:
                 fpath = Path(root) / f
                 ext = fpath.suffix.lower()

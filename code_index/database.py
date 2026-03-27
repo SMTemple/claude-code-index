@@ -1,9 +1,13 @@
-"""SQLite + sqlite-vec database layer for code index with timeout and error protection.
+"""SQLite + sqlite-vec database layer for code index -- lock-free reads, batched writes.
 
-Thread-safe: all methods serialize access via an RLock so concurrent MCP tool
-calls (which FastMCP dispatches to a thread pool) never corrupt connection state.
-WAL mode allows concurrent readers at the SQLite level; the RLock serialises
-Python-level access to the shared connection object.
+Concurrency model:
+  - WRITE operations serialise via _write_lock (RLock with timeout) on a single
+    write connection (self.conn).
+  - READ operations use per-thread read-only connections (via threading.local())
+    with NO Python-level lock.  SQLite WAL mode allows concurrent readers that
+    never block on (or get blocked by) writers.
+  - insert_chunks_batch releases the write lock between each batch commit so
+    concurrent reads are never starved during large indexing operations.
 """
 
 import sqlite3
@@ -13,6 +17,7 @@ import os
 import hashlib
 import re
 import threading
+from contextlib import contextmanager
 
 try:
     import sqlite_vec
@@ -22,7 +27,7 @@ except ImportError:
 
 VECTOR_DIM = 384
 
-# SQLite busy timeout in ms — how long to wait if another process holds the lock
+# SQLite busy timeout in ms -- how long to wait if another process holds the lock
 SQLITE_BUSY_TIMEOUT = int(os.environ.get('CODE_INDEX_DB_TIMEOUT', 30000))
 
 # Max number of SQL parameters per query (SQLite default limit is 999)
@@ -31,49 +36,87 @@ _SQL_VAR_BATCH = 500
 # How many chunks to insert before issuing a COMMIT (keeps lock hold time short)
 _WRITE_BATCH_SIZE = 50
 
+# Max seconds to wait for the Python-level write lock before raising an error
+_WRITE_LOCK_TIMEOUT = int(os.environ.get('CODE_INDEX_WRITE_TIMEOUT', 30))
+
 
 class CodeIndexDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._lock = threading.RLock()
+        self._write_lock = threading.RLock()
+        self._local = threading.local()  # per-thread read connections
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.conn = sqlite3.connect(
-            db_path,
-            timeout=SQLITE_BUSY_TIMEOUT / 1000,
-            check_same_thread=False,
-        )
-        self.conn.row_factory = sqlite3.Row
-        # Set busy timeout so concurrent access doesn't immediately fail
-        self.conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT}")
-        # WAL mode for better concurrent read/write performance
-        try:
-            self.conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError:
-            pass  # WAL not supported on this platform/build, use default
-        # NORMAL sync is safe with WAL and significantly faster than FULL
-        try:
-            self.conn.execute("PRAGMA synchronous = NORMAL")
-        except sqlite3.OperationalError:
-            pass
+        self.conn = self._open_connection()
         self._has_fts = False
+        self._has_vec = False  # cached after table creation
         if HAS_SQLITE_VEC:
             try:
                 self.conn.enable_load_extension(True)
                 sqlite_vec.load(self.conn)
                 self.conn.enable_load_extension(False)
             except Exception:
-                # If loading fails, disable vector search but continue
                 pass
         self._create_tables()
 
-    # ── Schema creation ───────────────────────────────────────────
+    # -- Connection management -------------------------------------------------
+
+    def _open_connection(self):
+        """Open a new SQLite connection with standard pragmas."""
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=SQLITE_BUSY_TIMEOUT / 1000,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT}")
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("PRAGMA synchronous = NORMAL")
+        except sqlite3.OperationalError:
+            pass
+        return conn
+
+    def _get_read_conn(self):
+        """Return a per-thread read connection.  No Python lock needed -- WAL
+        allows unlimited concurrent readers without blocking writers."""
+        conn = getattr(self._local, 'conn', None)
+        if conn is not None:
+            return conn
+        conn = self._open_connection()
+        if HAS_SQLITE_VEC:
+            try:
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
+            except Exception:
+                pass
+        self._local.conn = conn
+        return conn
+
+    @contextmanager
+    def _write_ctx(self):
+        """Context manager: acquire write lock with timeout, yield write connection."""
+        acquired = self._write_lock.acquire(timeout=_WRITE_LOCK_TIMEOUT)
+        if not acquired:
+            raise sqlite3.OperationalError(
+                f"Database write lock timeout after {_WRITE_LOCK_TIMEOUT}s -- "
+                "another write operation is in progress"
+            )
+        try:
+            yield self.conn
+        finally:
+            self._write_lock.release()
+
+    # -- Schema creation -------------------------------------------------------
     # Uses individual execute() calls instead of executescript() because
     # executescript() does NOT respect busy_timeout and can hang when
     # another process holds the database lock.
 
     def _create_tables(self):
-        with self._lock:
-            c = self.conn
+        with self._write_ctx() as c:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS code_chunks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,18 +172,18 @@ class CodeIndexDB:
                         )
                     """)
                 except sqlite3.OperationalError:
-                    # vec0 module not available even though import succeeded
                     pass
 
-            # FTS5 index — called while lock is held
+            # FTS5 index -- called while lock is held
             self._setup_fts()
             c.commit()
 
-    def _has_vec_table(self):
-        """Check if the vec0 virtual table actually exists and is usable.
+            # Cache extension availability (won't change during runtime)
+            self._has_vec = self._check_vec_table()
 
-        NOTE: Callers are expected to hold self._lock already.
-        """
+    def _check_vec_table(self):
+        """Check if the vec0 virtual table exists and is usable.
+        NOTE: Called during init with write lock held."""
         try:
             self.conn.execute("SELECT COUNT(*) FROM code_chunks_vec").fetchone()
             return True
@@ -149,9 +192,7 @@ class CodeIndexDB:
 
     def _setup_fts(self):
         """Set up FTS5 full-text search index for hybrid search.
-
-        NOTE: Called from _create_tables while self._lock is held.
-        """
+        NOTE: Called from _create_tables while write lock is held."""
         try:
             self.conn.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS code_chunks_fts USING fts5(
@@ -176,15 +217,15 @@ class CodeIndexDB:
         except Exception:
             self._has_fts = False
 
-    # ── Serialization helpers ─────────────────────────────────────
+    # -- Serialization helpers -------------------------------------------------
 
     def _serialize_vector(self, vec):
         return struct.pack(f'{len(vec)}f', *vec)
 
-    # ── Insert operations ─────────────────────────────────────────
+    # -- Insert operations (write lock) ----------------------------------------
 
     def _insert_chunk_unlocked(self, chunk: dict, embedding: list):
-        """Insert a single chunk. Caller MUST hold self._lock."""
+        """Insert a single chunk. Caller MUST hold write lock."""
         cursor = self.conn.execute(
             """INSERT INTO code_chunks
                (file_path, symbol_name, symbol_type, line_start, line_end,
@@ -199,7 +240,7 @@ class CodeIndexDB:
              chunk['search_text'], chunk['file_mtime'])
         )
         chunk_id = cursor.lastrowid
-        if self._has_vec_table():
+        if self._has_vec:
             try:
                 self.conn.execute(
                     "INSERT INTO code_chunks_vec(rowid, embedding) VALUES (?, ?)",
@@ -218,66 +259,67 @@ class CodeIndexDB:
         return chunk_id
 
     def insert_chunk(self, chunk: dict, embedding: list):
-        with self._lock:
+        with self._write_ctx():
             cid = self._insert_chunk_unlocked(chunk, embedding)
         return cid
 
     def insert_chunks_batch(self, chunks: list, embeddings: list):
-        """Insert chunks in batches, committing periodically so concurrent
-        reads are not blocked for the entire duration of a large insert."""
-        with self._lock:
-            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-                self._insert_chunk_unlocked(chunk, embedding)
-                if (i + 1) % _WRITE_BATCH_SIZE == 0:
-                    try:
-                        self.conn.commit()
-                    except (sqlite3.OperationalError, sqlite3.DatabaseError):
-                        pass
-            self.conn.commit()
+        """Insert chunks in batches, releasing the write lock between each
+        batch commit so concurrent reads are never starved."""
+        total = len(chunks)
+        for batch_start in range(0, total, _WRITE_BATCH_SIZE):
+            batch_end = min(batch_start + _WRITE_BATCH_SIZE, total)
+            with self._write_ctx():
+                for i in range(batch_start, batch_end):
+                    self._insert_chunk_unlocked(chunks[i], embeddings[i])
+                try:
+                    self.conn.commit()
+                except (sqlite3.OperationalError, sqlite3.DatabaseError):
+                    pass
 
-    # ── Search operations ─────────────────────────────────────────
+    # -- Search operations (lock-free reads) -----------------------------------
 
     def search_similar(self, query_embedding: list, limit: int = 10):
-        if not self._has_vec_table():
+        if not self._has_vec:
             return []
         try:
-            with self._lock:
-                rows = self.conn.execute(
-                    """SELECT v.rowid, v.distance, c.*
-                       FROM code_chunks_vec v
-                       INNER JOIN code_chunks c ON c.id = v.rowid
-                       WHERE v.embedding MATCH ?
-                         AND k = ?
-                       ORDER BY v.distance""",
-                    (self._serialize_vector(query_embedding), limit)
-                ).fetchall()
+            conn = self._get_read_conn()
+            rows = conn.execute(
+                """SELECT v.rowid, v.distance, c.*
+                   FROM code_chunks_vec v
+                   INNER JOIN code_chunks c ON c.id = v.rowid
+                   WHERE v.embedding MATCH ?
+                     AND k = ?
+                   ORDER BY v.distance""",
+                (self._serialize_vector(query_embedding), limit)
+            ).fetchall()
             return [dict(r) for r in rows]
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
-            # Vector search failed — return empty so hybrid search falls back to FTS
+            # Vector search failed -- return empty so hybrid search falls back to FTS
             return []
 
     def search_by_name(self, name: str, symbol_type: str = None):
         try:
-            with self._lock:
-                if symbol_type:
-                    rows = self.conn.execute(
-                        """SELECT * FROM code_chunks
-                           WHERE symbol_name LIKE ? AND symbol_type = ?
-                           ORDER BY file_path, line_start""",
-                        (f'%{name}%', symbol_type)
-                    ).fetchall()
-                else:
-                    rows = self.conn.execute(
-                        """SELECT * FROM code_chunks
-                           WHERE symbol_name LIKE ?
-                           ORDER BY file_path, line_start""",
-                        (f'%{name}%',)
-                    ).fetchall()
+            conn = self._get_read_conn()
+            if symbol_type:
+                rows = conn.execute(
+                    """SELECT * FROM code_chunks
+                       WHERE symbol_name LIKE ? AND symbol_type = ?
+                       ORDER BY file_path, line_start""",
+                    (f'%{name}%', symbol_type)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM code_chunks
+                       WHERE symbol_name LIKE ?
+                       ORDER BY file_path, line_start""",
+                    (f'%{name}%',)
+                ).fetchall()
             return [dict(r) for r in rows]
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
             return []
 
-    # ── Hybrid search (FTS5 + vector + type ranking) ─────────────
+    # -- Hybrid search (FTS5 + vector + type ranking) --------------------------
 
     @staticmethod
     def _sanitize_fts_query(query_text):
@@ -295,16 +337,16 @@ class CodeIndexDB:
         if not safe_query:
             return []
         try:
-            with self._lock:
-                rows = self.conn.execute(
-                    """SELECT c.*, fts.rank
-                       FROM code_chunks_fts fts
-                       INNER JOIN code_chunks c ON c.id = fts.rowid
-                       WHERE code_chunks_fts MATCH ?
-                       ORDER BY fts.rank
-                       LIMIT ?""",
-                    (safe_query, limit)
-                ).fetchall()
+            conn = self._get_read_conn()
+            rows = conn.execute(
+                """SELECT c.*, fts.rank
+                   FROM code_chunks_fts fts
+                   INNER JOIN code_chunks c ON c.id = fts.rowid
+                   WHERE code_chunks_fts MATCH ?
+                   ORDER BY fts.rank
+                   LIMIT ?""",
+                (safe_query, limit)
+            ).fetchall()
             return [dict(r) for r in rows]
         except Exception:
             return []
@@ -356,40 +398,42 @@ class CodeIndexDB:
                 return []
             # Search for the first meaningful word
             word = max(words, key=len)
-            with self._lock:
-                rows = self.conn.execute(
-                    """SELECT * FROM code_chunks
-                       WHERE search_text LIKE ? OR symbol_name LIKE ?
-                       ORDER BY file_path, line_start
-                       LIMIT ?""",
-                    (f'%{word}%', f'%{word}%', limit)
-                ).fetchall()
+            conn = self._get_read_conn()
+            rows = conn.execute(
+                """SELECT * FROM code_chunks
+                   WHERE search_text LIKE ? OR symbol_name LIKE ?
+                   ORDER BY file_path, line_start
+                   LIMIT ?""",
+                (f'%{word}%', f'%{word}%', limit)
+            ).fetchall()
             return [dict(r) for r in rows]
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
             return []
 
     def get_file_symbols(self, file_path: str):
         try:
-            with self._lock:
-                rows = self.conn.execute(
-                    """SELECT * FROM code_chunks
-                       WHERE file_path = ?
-                       ORDER BY line_start""",
-                    (file_path,)
-                ).fetchall()
+            conn = self._get_read_conn()
+            rows = conn.execute(
+                """SELECT * FROM code_chunks
+                   WHERE file_path = ?
+                   ORDER BY line_start""",
+                (file_path,)
+            ).fetchall()
             return [dict(r) for r in rows]
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
             return []
 
+    # -- Delete operations (write lock) ----------------------------------------
+
     def delete_file_chunks(self, file_path: str):
         try:
-            with self._lock:
+            with self._write_ctx():
                 ids = self.conn.execute(
                     "SELECT id FROM code_chunks WHERE file_path = ?",
                     (file_path,)
                 ).fetchall()
                 for row in ids:
-                    if self._has_vec_table():
+                    if self._has_vec:
                         try:
                             self.conn.execute(
                                 "DELETE FROM code_chunks_vec WHERE rowid = ?",
@@ -413,11 +457,11 @@ class CodeIndexDB:
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
             pass
 
-    # ── File tracking for smart change detection ─────────────────
+    # -- File tracking ---------------------------------------------------------
 
     def set_file_tracking(self, file_path: str, mtime: float, content_hash: str,
                           file_size: int, skipped: bool = False, skip_reason: str = None):
-        with self._lock:
+        with self._write_ctx():
             self.conn.execute(
                 """INSERT OR REPLACE INTO file_tracking
                    (file_path, file_mtime, content_hash, file_size, skipped, skip_reason)
@@ -426,7 +470,7 @@ class CodeIndexDB:
             )
 
     def set_file_tracking_batch(self, entries: list):
-        with self._lock:
+        with self._write_ctx():
             self.conn.executemany(
                 """INSERT OR REPLACE INTO file_tracking
                    (file_path, file_mtime, content_hash, file_size, skipped, skip_reason)
@@ -436,39 +480,45 @@ class CodeIndexDB:
             self.conn.commit()
 
     def get_file_tracking(self, file_path: str):
-        with self._lock:
-            row = self.conn.execute(
+        try:
+            conn = self._get_read_conn()
+            row = conn.execute(
                 "SELECT * FROM file_tracking WHERE file_path = ?",
                 (file_path,)
             ).fetchone()
-        return dict(row) if row else None
+            return dict(row) if row else None
+        except (sqlite3.OperationalError, sqlite3.DatabaseError):
+            return None
 
     def get_all_file_tracking(self):
-        with self._lock:
-            rows = self.conn.execute("SELECT * FROM file_tracking").fetchall()
-        return {r['file_path']: dict(r) for r in rows}
+        try:
+            conn = self._get_read_conn()
+            rows = conn.execute("SELECT * FROM file_tracking").fetchall()
+            return {r['file_path']: dict(r) for r in rows}
+        except (sqlite3.OperationalError, sqlite3.DatabaseError):
+            return {}
 
     def delete_file_tracking(self, file_path: str):
-        with self._lock:
+        with self._write_ctx():
             self.conn.execute(
                 "DELETE FROM file_tracking WHERE file_path = ?",
                 (file_path,)
             )
 
-    # ── Stats and meta ───────────────────────────────────────────
+    # -- Stats and meta --------------------------------------------------------
 
     def get_stats(self):
         try:
-            with self._lock:
-                total = self.conn.execute("SELECT COUNT(*) FROM code_chunks").fetchone()[0]
-                files = self.conn.execute("SELECT COUNT(DISTINCT file_path) FROM code_chunks").fetchone()[0]
-                types = self.conn.execute(
-                    "SELECT symbol_type, COUNT(*) FROM code_chunks GROUP BY symbol_type"
-                ).fetchall()
-                tracked = self.conn.execute("SELECT COUNT(*) FROM file_tracking").fetchone()[0]
-                skipped = self.conn.execute(
-                    "SELECT COUNT(*) FROM file_tracking WHERE skipped = 1"
-                ).fetchone()[0]
+            conn = self._get_read_conn()
+            total = conn.execute("SELECT COUNT(*) FROM code_chunks").fetchone()[0]
+            files = conn.execute("SELECT COUNT(DISTINCT file_path) FROM code_chunks").fetchone()[0]
+            types = conn.execute(
+                "SELECT symbol_type, COUNT(*) FROM code_chunks GROUP BY symbol_type"
+            ).fetchall()
+            tracked = conn.execute("SELECT COUNT(*) FROM file_tracking").fetchone()[0]
+            skipped = conn.execute(
+                "SELECT COUNT(*) FROM file_tracking WHERE skipped = 1"
+            ).fetchone()[0]
             return {
                 'total_chunks': total,
                 'total_files': files,
@@ -488,17 +538,17 @@ class CodeIndexDB:
 
     def get_meta(self, key: str):
         try:
-            with self._lock:
-                row = self.conn.execute(
-                    "SELECT value FROM index_meta WHERE key = ?", (key,)
-                ).fetchone()
+            conn = self._get_read_conn()
+            row = conn.execute(
+                "SELECT value FROM index_meta WHERE key = ?", (key,)
+            ).fetchone()
             return row[0] if row else None
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
             return None
 
     def set_meta(self, key: str, value: str):
         try:
-            with self._lock:
+            with self._write_ctx():
                 self.conn.execute(
                     "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                     (key, value)
@@ -509,15 +559,15 @@ class CodeIndexDB:
 
     def get_indexed_files(self):
         try:
-            with self._lock:
-                rows = self.conn.execute(
-                    "SELECT DISTINCT file_path, MAX(file_mtime) as mtime FROM code_chunks GROUP BY file_path"
-                ).fetchall()
+            conn = self._get_read_conn()
+            rows = conn.execute(
+                "SELECT DISTINCT file_path, MAX(file_mtime) as mtime FROM code_chunks GROUP BY file_path"
+            ).fetchall()
             return {r[0]: r[1] for r in rows}
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
             return {}
 
-    # ── Embedding cache ───────────────────────────────────────────
+    # -- Embedding cache -------------------------------------------------------
 
     @staticmethod
     def hash_text(text: str) -> str:
@@ -526,11 +576,11 @@ class CodeIndexDB:
     def get_cached_embedding(self, text_hash: str):
         """Return deserialized embedding list or None if not cached."""
         try:
-            with self._lock:
-                row = self.conn.execute(
-                    "SELECT embedding FROM embedding_cache WHERE text_hash = ?",
-                    (text_hash,)
-                ).fetchone()
+            conn = self._get_read_conn()
+            row = conn.execute(
+                "SELECT embedding FROM embedding_cache WHERE text_hash = ?",
+                (text_hash,)
+            ).fetchone()
             if row is None:
                 return None
             blob = row[0]
@@ -548,19 +598,19 @@ class CodeIndexDB:
             return {}
         result = {}
         try:
-            with self._lock:
-                for start in range(0, len(text_hashes), _SQL_VAR_BATCH):
-                    batch = text_hashes[start:start + _SQL_VAR_BATCH]
-                    placeholders = ','.join('?' * len(batch))
-                    rows = self.conn.execute(
-                        f"SELECT text_hash, embedding FROM embedding_cache "
-                        f"WHERE text_hash IN ({placeholders})",
-                        batch
-                    ).fetchall()
-                    for row in rows:
-                        blob = row[1]
-                        count = len(blob) // 4
-                        result[row[0]] = list(struct.unpack(f'{count}f', blob))
+            conn = self._get_read_conn()
+            for start in range(0, len(text_hashes), _SQL_VAR_BATCH):
+                batch = text_hashes[start:start + _SQL_VAR_BATCH]
+                placeholders = ','.join('?' * len(batch))
+                rows = conn.execute(
+                    f"SELECT text_hash, embedding FROM embedding_cache "
+                    f"WHERE text_hash IN ({placeholders})",
+                    batch
+                ).fetchall()
+                for row in rows:
+                    blob = row[1]
+                    count = len(blob) // 4
+                    result[row[0]] = list(struct.unpack(f'{count}f', blob))
         except (sqlite3.OperationalError, sqlite3.DatabaseError):
             pass
         return result
@@ -568,7 +618,7 @@ class CodeIndexDB:
     def set_cached_embeddings_batch(self, pairs: list):
         """Store [(text_hash, embedding_list), ...] into the cache."""
         try:
-            with self._lock:
+            with self._write_ctx():
                 self.conn.executemany(
                     "INSERT OR REPLACE INTO embedding_cache (text_hash, embedding) VALUES (?, ?)",
                     [(h, self._serialize_vector(e)) for h, e in pairs]
@@ -579,8 +629,8 @@ class CodeIndexDB:
 
     def clear_all(self):
         try:
-            with self._lock:
-                if self._has_vec_table():
+            with self._write_ctx():
+                if self._has_vec:
                     self.conn.execute("DELETE FROM code_chunks_vec")
                 self.conn.execute("DELETE FROM code_chunks")
                 if self._has_fts:
