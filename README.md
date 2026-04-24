@@ -208,9 +208,9 @@ Prefer `mcp__code-index` tools (`search_code`, `search_symbol`, `get_file_overvi
 
 ---
 
-## Step 6 — (Optional) Install the `/index-project` slash command
+## Step 6 — Install the `/index-project` slash command
 
-This gives you a `/index-project` command inside Claude Code so you don't have to type the full path to `reindex_cli.py`.
+This is the command you'll use day-to-day to rebuild or refresh the index. Run it from inside any Claude Code session.
 
 ```bash
 mkdir -p ~/.claude/skills/index-project
@@ -218,8 +218,10 @@ cp skills/index-project/SKILL.md ~/.claude/skills/index-project/
 ```
 
 Usage, from inside a Claude Code session opened in a project:
-- `/index-project --full` — **full reindex from scratch** (use this for the initial build in Step 8, and any time you want a clean rebuild)
+- `/index-project --full` — **full reindex from scratch** (first-time init, or a clean rebuild)
 - `/index-project` — incremental reindex (fast, only changed files)
+
+> The skill shells out to `~/.claude/tools/code-indexer/reindex_cli.py` under the hood. If you used a dedicated venv in Step 1, edit `~/.claude/skills/index-project/SKILL.md` and swap `python` for your venv Python path (e.g. `~/.claude-code-index-venv/Scripts/python` on Windows, `~/.claude-code-index-venv/bin/python` on Mac/Linux).
 
 ---
 
@@ -234,26 +236,23 @@ git config --global core.excludesfile ~/.gitignore_global
 
 ---
 
-## Step 8 — Build the initial index for a project (`--full`)
+## Step 8 — Build the initial index for a project (`/index-project --full`)
 
-The very first time you use the index in a project, you need to build it from scratch. Run this inside the project root:
+The very first time you use the index in a project, you need to build it from scratch.
 
-```bash
-cd ~/path/to/your-project
-
-# If Python is on PATH:
-python ~/.claude/tools/code-indexer/reindex_cli.py --full
-
-# If you used the dedicated venv (Step 1):
-# Windows (Git Bash):
-~/.claude-code-index-venv/Scripts/python ~/.claude/tools/code-indexer/reindex_cli.py --full
-# macOS / Linux:
-~/.claude-code-index-venv/bin/python ~/.claude/tools/code-indexer/reindex_cli.py --full
-```
+1. Open Claude Code inside the project root:
+   ```bash
+   cd ~/path/to/your-project
+   claude
+   ```
+2. At the Claude Code prompt, type:
+   ```
+   /index-project --full
+   ```
 
 What happens:
 
-1. A small Tk progress window pops up (on Windows/macOS/Linux with Tk installed)
+1. A small Tk progress window pops up (Windows/macOS/Linux with Tk installed)
 2. Your terminal shows a live progress bar — file discovery → parse → embed → store
 3. A `.code_index/` folder is created in the project root with the SQLite vector DB
 4. Takes 10–60 seconds on small projects, 2–3 minutes on large ones (1000+ files)
@@ -273,14 +272,31 @@ When it finishes you'll see something like:
     ...
 ```
 
-### `--full` vs incremental — when to use which
+### `/index-project --full` vs incremental — when to use which
 
-| Flag | What it does | When to run it |
+| Command | What it does | When to run it |
 |---|---|---|
-| `--full` | Wipes `.code_index/` and rebuilds from scratch | **First time in a project.** Also any time the index looks broken, you've done a huge refactor, or you've pulled a branch that diverged massively |
-| *(no flag)* | Incremental — only re-processes files whose mtime or content hash changed | Everyday refreshes. Fast — milliseconds to seconds. This is what the background hooks run automatically |
+| `/index-project --full` | Wipes `.code_index/` and rebuilds from scratch | **First time in a project.** Also any time the index looks broken, you've done a huge refactor, or you've pulled a branch that diverged massively |
+| `/index-project` | Incremental — only re-processes files whose mtime or content hash changed | Everyday refreshes. Fast — milliseconds to seconds. This is what the background hooks run automatically between prompts |
 
-You almost never need to run the incremental reindex by hand — the `UserPromptSubmit` hook does it for you between prompts whenever files changed. `--full` is the one you'll actually type.
+You almost never need to run the incremental reindex by hand — the `UserPromptSubmit` hook does it for you between prompts whenever files changed. `/index-project --full` is the one you'll actually type.
+
+### Fallback: running the CLI directly (skill not installed / outside Claude Code)
+
+If you skipped Step 6 or want to run the indexer outside a Claude Code session, invoke the CLI directly from the project root:
+
+```bash
+# If Python is on PATH:
+python ~/.claude/tools/code-indexer/reindex_cli.py --full
+
+# If you used the dedicated venv (Step 1):
+# Windows (Git Bash):
+~/.claude-code-index-venv/Scripts/python ~/.claude/tools/code-indexer/reindex_cli.py --full
+# macOS / Linux:
+~/.claude-code-index-venv/bin/python ~/.claude/tools/code-indexer/reindex_cli.py --full
+```
+
+Drop `--full` for an incremental reindex. Same effect as the slash command — just more typing.
 
 ---
 
@@ -303,26 +319,19 @@ If you don't see index tools being used, check:
 
 You shouldn't have to do anything. Claude calls the index tools automatically. After you edit files, the next prompt triggers a background incremental reindex. You just keep working.
 
-**When to manually run `--full` again:**
+**When to manually run `/index-project --full`:**
 - You pulled a branch with a huge diff and searches feel stale
 - You added/removed a bunch of top-level directories
 - `mcp__code-index__index_status` reports missing files or looks wrong
 - You upgraded the embedding model or the indexer itself
 
-```bash
-# From the project root:
-python ~/.claude/tools/code-indexer/reindex_cli.py --full
-# or with venv:
-~/.claude-code-index-venv/bin/python ~/.claude/tools/code-indexer/reindex_cli.py --full
-```
-
-**Or, if you installed the optional slash command in Step 6:**
+From inside a Claude Code session in the project:
 
 ```
 /index-project --full
 ```
 
-…from inside a Claude Code session. Same effect, no typing the long path.
+(See Step 8's "Fallback" section if you need to run it without the slash command.)
 
 ---
 
@@ -354,7 +363,7 @@ claude mcp add --scope user code-index -- /full/path/to/python ~/.claude/tools/c
 ```
 
 **Index looks stale**
-Force a full rebuild: `python ~/.claude/tools/code-indexer/reindex_cli.py --full`
+Force a full rebuild from a Claude Code session: `/index-project --full` (or run `python ~/.claude/tools/code-indexer/reindex_cli.py --full` from the project root if you don't have the slash command installed).
 
 **Hooks not firing**
 - JSON must be valid — run `python -m json.tool ~/.claude/settings.json` to check
