@@ -62,8 +62,8 @@ def search_code(query: str, limit: int = 10) -> str:
 @mcp.tool()
 def search_symbol(name: str, symbol_type: str = None) -> str:
     """Search for a symbol by name. Optionally filter by type:
-    function, method, class, route, constant, file_summary.
-    Examples: search_symbol("start_analysis"), search_symbol("cleanup", "method")
+    function, method, class, interface, trait, enum, namespace, route, constant, file_summary.
+    Examples: search_symbol("start_analysis"), search_symbol("cleanup", "method"), search_symbol("parsePage", "function")
     """
     try:
         results = indexer.search_symbol(name, symbol_type)

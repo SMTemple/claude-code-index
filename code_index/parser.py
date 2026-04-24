@@ -34,24 +34,34 @@ SKIP_DIRS = {
     '.sass-cache',
     # WordPress large dirs
     'uploads', 'wp-content/uploads',
+    # Old / archived copies of code
+    'old', '.old',
 }
 
-# Directory name suffixes that should also be skipped (e.g. *.egg-info)
-SKIP_DIR_SUFFIXES = ('.egg-info',)
+# Directory name suffixes that should also be skipped (e.g. *.egg-info, *.old)
+SKIP_DIR_SUFFIXES = ('.egg-info', '.old')
+
+# Directories to skip ONLY when they appear at the project root.
+# Useful for short/ambiguous names that are meaningful deep in a tree
+# (e.g. a `n` dir in node_modules) but are scratch/notes folders at the root.
+ROOT_ONLY_SKIP_DIRS = {
+    'n',
+}
 
 # File extensions to index, grouped by parse strategy
 PYTHON_EXTS = {'.py'}
 JS_TS_EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
+PHP_EXTS = {'.php', '.phtml', '.php3', '.php4', '.php5', '.phps'}
 WEB_EXTS = {'.html', '.htm', '.css', '.scss', '.less', '.vue', '.svelte'}
 CONFIG_EXTS = {'.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf'}
 DOC_EXTS = {'.md', '.rst', '.txt'}
 TEMPLATE_EXTS = {'.jinja', '.jinja2', '.j2', '.hbs', '.ejs', '.pug'}
 SHELL_EXTS = {'.sh', '.bash', '.zsh', '.ps1', '.bat', '.cmd'}
 DATA_EXTS = {'.sql', '.graphql', '.gql', '.proto'}
-OTHER_CODE_EXTS = {'.php', '.rb', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.cpp', '.h', '.hpp', '.cs'}
+OTHER_CODE_EXTS = {'.rb', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.cpp', '.h', '.hpp', '.cs'}
 
 ALL_INDEXABLE_EXTS = (
-    PYTHON_EXTS | JS_TS_EXTS | WEB_EXTS | CONFIG_EXTS | DOC_EXTS |
+    PYTHON_EXTS | JS_TS_EXTS | PHP_EXTS | WEB_EXTS | CONFIG_EXTS | DOC_EXTS |
     TEMPLATE_EXTS | SHELL_EXTS | DATA_EXTS | OTHER_CODE_EXTS
 )
 
@@ -113,9 +123,11 @@ class CodeParser:
         """Find all indexable files, skipping vendor/build/venv dirs."""
         found = []
         for root, dirs, files in os.walk(self.project_root):
+            is_root = Path(root) == self.project_root
             dirs[:] = [d for d in dirs
                        if d not in SKIP_DIRS
-                       and not d.endswith(SKIP_DIR_SUFFIXES)]
+                       and not d.endswith(SKIP_DIR_SUFFIXES)
+                       and not (is_root and d in ROOT_ONLY_SKIP_DIRS)]
             for f in files:
                 fpath = Path(root) / f
                 ext = fpath.suffix.lower()
@@ -196,6 +208,8 @@ class CodeParser:
             return self._parse_python(file_path)
         elif ext in JS_TS_EXTS:
             return self._parse_js_ts(file_path)
+        elif ext in PHP_EXTS:
+            return self._parse_php(file_path)
         else:
             return self._parse_generic(file_path)
 
@@ -440,6 +454,76 @@ class CodeParser:
                     'parent_class': None,
                     'route_path': None,
                     'search_text': f"{symbol_type}: {name}\n{source_chunk[:500]}",
+                    'file_mtime': mtime,
+                })
+
+        return chunks
+
+    # ── PHP parsing (regex-based, extracts functions/classes/namespaces) ──
+
+    _PHP_NAMESPACE_RE = re.compile(r'^[ \t]*namespace[ \t]+([\w\\]+)[ \t]*[;{]', re.MULTILINE | re.IGNORECASE)
+    _PHP_CLASS_RE = re.compile(r'^[ \t]*(?:abstract[ \t]+|final[ \t]+|readonly[ \t]+)*class[ \t]+(\w+)', re.MULTILINE | re.IGNORECASE)
+    _PHP_INTERFACE_RE = re.compile(r'^[ \t]*interface[ \t]+(\w+)', re.MULTILINE | re.IGNORECASE)
+    _PHP_TRAIT_RE = re.compile(r'^[ \t]*trait[ \t]+(\w+)', re.MULTILINE | re.IGNORECASE)
+    _PHP_ENUM_RE = re.compile(r'^[ \t]*enum[ \t]+(\w+)', re.MULTILINE | re.IGNORECASE)
+    # Captures both top-level functions and class methods — PHP regex can't
+    # cheaply tell them apart without a real parser, so we just call them "function".
+    _PHP_FUNCTION_RE = re.compile(
+        r'^[ \t]*(?:(?:public|protected|private|static|final|abstract)[ \t]+)*'
+        r'function[ \t]+&?(\w+)[ \t]*\(',
+        re.MULTILINE | re.IGNORECASE,
+    )
+    _PHP_CONST_RE = re.compile(r'^[ \t]*(?:(?:public|protected|private|final)[ \t]+)*const[ \t]+(\w+)', re.MULTILINE | re.IGNORECASE)
+    _PHP_DEFINE_RE = re.compile(r'\bdefine[ \t]*\([ \t]*[\'"](\w+)[\'"]', re.IGNORECASE)
+
+    def _parse_php(self, file_path: Path) -> List[Dict]:
+        try:
+            source = file_path.read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            return []
+
+        rel_path = str(file_path.relative_to(self.project_root)).replace('\\', '/')
+        mtime = file_path.stat().st_mtime
+        lines = source.splitlines()
+        chunks = [self._make_file_summary(rel_path, lines, mtime)]
+
+        symbol_patterns = [
+            ('namespace', self._PHP_NAMESPACE_RE),
+            ('class', self._PHP_CLASS_RE),
+            ('interface', self._PHP_INTERFACE_RE),
+            ('trait', self._PHP_TRAIT_RE),
+            ('enum', self._PHP_ENUM_RE),
+            ('function', self._PHP_FUNCTION_RE),
+            ('constant', self._PHP_CONST_RE),
+            ('constant', self._PHP_DEFINE_RE),
+        ]
+
+        seen = set()  # (symbol_type, name, line_num) to dedupe across overlapping patterns
+
+        for sym_type, pattern in symbol_patterns:
+            for match in pattern.finditer(source):
+                name = match.group(1)
+                line_num = source[:match.start()].count('\n') + 1
+                key = (sym_type, name, line_num)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                end_line = min(line_num + 30, len(lines))
+                source_chunk = '\n'.join(lines[line_num - 1:end_line])
+
+                chunks.append({
+                    'file_path': rel_path,
+                    'symbol_name': name,
+                    'symbol_type': sym_type,
+                    'line_start': line_num,
+                    'line_end': end_line,
+                    'source_code': source_chunk[:1000],
+                    'docstring': None,
+                    'decorators': [],
+                    'parent_class': None,
+                    'route_path': None,
+                    'search_text': f"{sym_type}: {name}\n{source_chunk[:500]}",
                     'file_mtime': mtime,
                 })
 
