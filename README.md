@@ -210,16 +210,16 @@ Prefer `mcp__code-index` tools (`search_code`, `search_symbol`, `get_file_overvi
 
 ## Step 6 — (Optional) Install the `/index-project` slash command
 
-This gives you a `/index-project` command inside Claude Code with a live progress bar.
+This gives you a `/index-project` command inside Claude Code so you don't have to type the full path to `reindex_cli.py`.
 
 ```bash
 mkdir -p ~/.claude/skills/index-project
 cp skills/index-project/SKILL.md ~/.claude/skills/index-project/
 ```
 
-Usage:
+Usage, from inside a Claude Code session opened in a project:
+- `/index-project --full` — **full reindex from scratch** (use this for the initial build in Step 8, and any time you want a clean rebuild)
 - `/index-project` — incremental reindex (fast, only changed files)
-- `/index-project --full` — full reindex from scratch
 
 ---
 
@@ -234,32 +234,95 @@ git config --global core.excludesfile ~/.gitignore_global
 
 ---
 
-## Step 8 — Verify end-to-end
+## Step 8 — Build the initial index for a project (`--full`)
 
-1. Open a Claude Code session in any project: `cd ~/your-project && claude`
+The very first time you use the index in a project, you need to build it from scratch. Run this inside the project root:
+
+```bash
+cd ~/path/to/your-project
+
+# If Python is on PATH:
+python ~/.claude/tools/code-indexer/reindex_cli.py --full
+
+# If you used the dedicated venv (Step 1):
+# Windows (Git Bash):
+~/.claude-code-index-venv/Scripts/python ~/.claude/tools/code-indexer/reindex_cli.py --full
+# macOS / Linux:
+~/.claude-code-index-venv/bin/python ~/.claude/tools/code-indexer/reindex_cli.py --full
+```
+
+What happens:
+
+1. A small Tk progress window pops up (on Windows/macOS/Linux with Tk installed)
+2. Your terminal shows a live progress bar — file discovery → parse → embed → store
+3. A `.code_index/` folder is created in the project root with the SQLite vector DB
+4. Takes 10–60 seconds on small projects, 2–3 minutes on large ones (1000+ files)
+
+When it finishes you'll see something like:
+
+```
+  ==================================================
+  Complete in 42.3s
+  Files indexed: 287
+  Files skipped: 41 (non-indexable)
+  Total chunks:  1,942
+  Symbol types:
+    function: 612
+    class: 84
+    method: 443
+    ...
+```
+
+### `--full` vs incremental — when to use which
+
+| Flag | What it does | When to run it |
+|---|---|---|
+| `--full` | Wipes `.code_index/` and rebuilds from scratch | **First time in a project.** Also any time the index looks broken, you've done a huge refactor, or you've pulled a branch that diverged massively |
+| *(no flag)* | Incremental — only re-processes files whose mtime or content hash changed | Everyday refreshes. Fast — milliseconds to seconds. This is what the background hooks run automatically |
+
+You almost never need to run the incremental reindex by hand — the `UserPromptSubmit` hook does it for you between prompts whenever files changed. `--full` is the one you'll actually type.
+
+---
+
+## Step 9 — Verify end-to-end
+
+1. Open a Claude Code session in the project you just indexed: `cd ~/your-project && claude`
 2. Ask Claude something that needs code search, e.g. *"What does the main entry point of this project do?"*
 3. Claude should call `mcp__code-index__search_code` or `mcp__code-index__get_file_overview` — you'll see the tool calls in the session
-4. First time in a project, Claude will kick off an initial index build (10–60s depending on size)
 
 If you don't see index tools being used, check:
 
 - `claude mcp get code-index` — is the server registered?
 - Your CLAUDE.md — did the "Code Index (MANDATORY)" section get added?
 - `~/.claude/settings.json` — are the hooks present and valid JSON?
+- Does `.code_index/code_index.db` exist in the project root? If not, Step 8 didn't complete — run it again
 
 ---
 
 ## Day-to-day usage
 
-You shouldn't have to do anything. Claude calls the index tools automatically. After you edit files, the next prompt triggers a background reindex. You just keep working.
+You shouldn't have to do anything. Claude calls the index tools automatically. After you edit files, the next prompt triggers a background incremental reindex. You just keep working.
 
-If you ever want to force a full rebuild:
+**When to manually run `--full` again:**
+- You pulled a branch with a huge diff and searches feel stale
+- You added/removed a bunch of top-level directories
+- `mcp__code-index__index_status` reports missing files or looks wrong
+- You upgraded the embedding model or the indexer itself
 
 ```bash
+# From the project root:
 python ~/.claude/tools/code-indexer/reindex_cli.py --full
 # or with venv:
 ~/.claude-code-index-venv/bin/python ~/.claude/tools/code-indexer/reindex_cli.py --full
 ```
+
+**Or, if you installed the optional slash command in Step 6:**
+
+```
+/index-project --full
+```
+
+…from inside a Claude Code session. Same effect, no typing the long path.
 
 ---
 
