@@ -1,0 +1,27 @@
+# Embedding backends. Both produce 384-dim vectors from MiniLM-L6-v2 and are
+# cache-interchangeable (same model weights).
+#
+# Default preference: fastembed FIRST. Loads in ~1.3s vs ~8.7s for PyTorch,
+# which matters on every MCP server cold start. Inference is ~70 chunks/sec
+# (vs ~437 for sentence-transformers); break-even is ~600 new chunks per build
+# pass — below that fastembed wins on total wall time. Most incremental reindexes
+# hit the embedding cache and embed only a handful of changed chunks anyway.
+# Override with CODE_INDEX_BACKEND=sentence_transformers for large-repo full builds.
+fastembed>=0.3.0
+
+# Fallback / high-throughput alternative: sentence-transformers (PyTorch + MKL/ONNX).
+# Auto-detects CUDA/MPS for GPU acceleration. Best for full rebuilds of repos with
+# thousands of chunks. Override with CODE_INDEX_BACKEND=sentence_transformers.
+sentence-transformers>=2.2.0
+
+# Optional GPU acceleration for fastembed (NVIDIA only, replaces CPU ONNX
+# providers with CUDAExecutionProvider). Install only if you have CUDA:
+#   uv pip install fastembed-gpu
+# fastembed-gpu
+
+# MCP server (already required by code_index_server.py)
+mcp>=1.0.0
+
+# LLM summarization — used by _generate_project_summary() (Haiku, cheap)
+# Falls back gracefully to static-only summary if not installed or ANTHROPIC_API_KEY not set
+anthropic>=0.40.0

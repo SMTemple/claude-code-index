@@ -2,12 +2,15 @@
 
 import ast
 import hashlib
+import logging
 import os
 import re
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
-# Directories to always skip (exact name match at any depth)
+logger = logging.getLogger(__name__)
+
+# Directories to always skip (exact basename match at any depth)
 SKIP_DIRS = {
     '__pycache__', '.git', '.svn', '.hg',
     'venv', '.venv', 'env', '.env',
@@ -32,11 +35,96 @@ SKIP_DIRS = {
     '.vercel', '.netlify', '.amplify',
     # Sass / CSS caches
     '.sass-cache',
-    # WordPress large dirs
-    'uploads', 'wp-content/uploads',
+    # Mac zip artifacts
+    '__MACOSX',
+    # WordPress core (never edit, unambiguous names)
+    'wp-admin', 'wp-includes',
+    # WordPress core clone directory (Docker/local-dev installs)
+    'wordpress',
+    # WordPress large/junk dirs (unambiguous names)
+    'uploads',                  # wp-content/uploads — media library
+    'ai1wm-backups',            # All-in-One WP Migration backups
+    'updraft',                  # UpdraftPlus backups
+    'wp-rocket-config',         # WP Rocket per-host config
+    'w3tc-config',              # W3 Total Cache config
+    'wflogs',                   # Wordfence logs
+    'endurance-page-cache',     # Bluehost/Endurance page cache
+    'upgrade-temp-backup',      # WP core auto-update temp dir
+    'breeze-cache',             # Cloudways Breeze cache
+    'litespeed-cache',          # LiteSpeed cache (when as a dir)
+    'et-cache',                 # Elegant Themes (Divi) cache
+    'smush-webp',               # Smush image optimization output
+    # WordPress default bundled themes — pure boilerplate, never edited
+    'twentyfifteen', 'twentysixteen', 'twentyseventeen', 'twentyeighteen',
+    'twentynineteen', 'twentytwenty', 'twentytwentyone', 'twentytwentytwo',
+    'twentytwentythree', 'twentytwentyfour', 'twentytwentyfive',
+    # Popular premium parent themes — custom code is always in a child theme
+    'Divi', 'Avada', 'Jupiter', 'Salient', 'Betheme', 'X', 'enfold',
     # Old / archived copies of code
     'old', '.old',
 }
+
+# Directories to skip ONLY when their direct parent has one of these names.
+# Useful for generic names ('cache', 'upgrade') that are safe to index in
+# arbitrary projects but are junk inside specific contexts (wp-content).
+PARENT_SCOPED_SKIP_DIRS = {
+    'wp-content': {
+        'cache',          # any cache plugin's output
+        'upgrade',        # WP core upgrade staging
+        'wp-rocket',      # WP Rocket cache (per-host subdirs)
+        'plugins',        # 3rd-party plugins — custom code lives in themes/mu-plugins
+        'plugins-old',
+        'themes-old',
+        'mu-plugins-old',
+        'languages',      # auto-generated translations
+    },
+    # mu-plugins DOES hold our custom code, so it is not skipped wholesale.
+    # But managed hosts inject their own platform mu-plugins there, and those
+    # are vendor code we never edit. Skip the known host-injected ones by name.
+    'mu-plugins': {
+        # WP Engine
+        'wpengine-common', 'wpe-cache-plugin', 'wpe-update-source-selector',
+        'wpe-wp-sign-on-plugin', 'object-cache-pro',
+        # Other managed hosts
+        'endurance-page-cache',   # Bluehost/Endurance
+        'kinsta-mu-plugins',      # Kinsta
+        'wp-stack-cache',         # Cloudways
+        'pantheon-mu-plugin',     # Pantheon
+    },
+}
+
+# A wp-content root does not always sit in a folder literally named
+# 'wp-content'. All-in-One WP Migration (.wpress) archives extract wp-content's
+# *contents* to the archive root, so the tree looks like
+# `<pull-dir>/plugins`, `<pull-dir>/themes`, ... and every 'wp-content'
+# parent-scoped rule above would silently never fire. Detect the directory by
+# its shape instead of its name so those rules still apply.
+# (Observed 2026-08-04: a .wpress pull indexed 30,210 chunks of third-party
+# plugin code — 91% of the whole index — purely because of this.)
+WP_CONTENT_MARKER_DIRS = {'plugins', 'themes', 'mu-plugins', 'uploads'}
+WP_CONTENT_MIN_MARKERS = 3
+
+
+def looks_like_wp_content(dir_names, file_names=()) -> bool:
+    """True when a directory's children look unmistakably like wp-content's.
+
+    Marker dirs alone are NOT sufficient: `plugins/` + `themes/` + `uploads/`
+    is a plausible shape for a non-WordPress plugin-architecture app, and a
+    false positive here silently prunes real source from the index. So a match
+    also requires one WordPress-specific corroborating signal:
+
+      * `mu-plugins/` — a near-unique WordPress term, or
+      * an `index.php` file — WordPress ships wp-content/index.php ("silence
+        is golden"), which a Node/Python project with those dirs would not have.
+
+    Erring toward a false NEGATIVE is deliberate: failing to detect means we
+    index some vendor noise (visible, annoying), while a false positive means
+    we silently drop real code (invisible, harmful).
+    """
+    matched = WP_CONTENT_MARKER_DIRS.intersection(dir_names)
+    if len(matched) < WP_CONTENT_MIN_MARKERS:
+        return False
+    return 'mu-plugins' in matched or 'index.php' in file_names
 
 # Directory name suffixes that should also be skipped (e.g. *.egg-info, *.old)
 SKIP_DIR_SUFFIXES = ('.egg-info', '.old')
@@ -81,6 +169,15 @@ SKIP_FILENAMES = {
     'Pipfile.lock', 'poetry.lock', 'composer.lock', 'Gemfile.lock',
     'cargo.lock', 'flake.lock',
     '.DS_Store', 'Thumbs.db', 'desktop.ini',
+    # WordPress: secrets + boilerplate
+    'wp-config.php',          # contains DB creds + 8 secret keys — never index
+    'wp-config-sample.php',   # WP boilerplate
+    'wp-cli.yml',             # tiny config
+    'readme.html',            # WP root readme (boilerplate)
+    'wp-activate.php', 'wp-blog-header.php', 'wp-comments-post.php',
+    'wp-cron.php', 'wp-links-opml.php', 'wp-load.php', 'wp-login.php',
+    'wp-mail.php', 'wp-settings.php', 'wp-signup.php',
+    'wp-trackback.php', 'xmlrpc.php',
 }
 
 # Filename patterns to skip (compiled once)
@@ -123,9 +220,37 @@ class CodeParser:
         """Find all indexable files, skipping vendor/build/venv dirs."""
         found = []
         for root, dirs, files in os.walk(self.project_root):
-            is_root = Path(root) == self.project_root
+            root_path = Path(root)
+            is_root = root_path == self.project_root
+            current_dir_name = root_path.name
+            # Only apply parent-scoped skips when we're NOT at the project root —
+            # otherwise pointing the indexer directly at a `wp-content/` dir would
+            # silently prune top-level children like `cache`, `languages`, etc.
+            # Parent-scoped skips resolve by directory NAME, falling back to
+            # shape detection so an extracted wp-content tree (e.g. a .wpress
+            # pull, where the folder is named after the pull timestamp) still
+            # gets the 'wp-content' rules applied.
+            scoped_key = current_dir_name
+            if (not is_root
+                    and scoped_key not in PARENT_SCOPED_SKIP_DIRS
+                    and looks_like_wp_content(dirs, files)):
+                scoped_key = 'wp-content'
+                # Log it: this prunes whole subtrees, and a silent prune is
+                # exactly the failure mode this detection was added to fix.
+                logger.info(
+                    'wp-content shape detected at %s - applying wp-content '
+                    'skip rules (%s)',
+                    root_path,
+                    ', '.join(sorted(PARENT_SCOPED_SKIP_DIRS['wp-content']
+                                     .intersection(dirs))) or 'none pruned',
+                )
+            scoped_skips = (
+                PARENT_SCOPED_SKIP_DIRS.get(scoped_key, set())
+                if not is_root else set()
+            )
             dirs[:] = [d for d in dirs
                        if d not in SKIP_DIRS
+                       and d not in scoped_skips
                        and not d.endswith(SKIP_DIR_SUFFIXES)
                        and not (is_root and d in ROOT_ONLY_SKIP_DIRS)]
             for f in files:

@@ -1,6 +1,8 @@
 """Build/update orchestrator for the code index with smart change detection and timeout protection."""
 
+import json
 import os
+import re
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
@@ -340,6 +342,7 @@ class CodeIndexer:
         self.db.set_meta('total_files', str(indexed_count))
         self.db.set_meta('skipped_files', str(skipped_count))
         self.db.set_meta('project_root', str(self.project_root))
+        self._generate_project_summary(has_meaningful_changes=True)
 
     def force_reindex(self, full: bool = True, progress_callback=None):
         """Force rebuild. If full=True, clears all data and starts fresh.
@@ -472,6 +475,7 @@ class CodeIndexer:
         self.db.set_meta('incremental_time_seconds', f'{elapsed:.1f}')
         self.db.set_meta('files_reindexed', str(len(needs_index)))
         self.db.set_meta('files_deleted', str(len(needs_delete)))
+        self._generate_project_summary(has_meaningful_changes=bool(needs_index or needs_delete))
 
     def _get_query_embedding(self, query: str):
         """Get embedding for a search query, using in-memory LRU cache."""
@@ -547,6 +551,446 @@ class CodeIndexer:
                 'indexed': False,
                 'message': f'Index exists but is unreadable: {e}',
             }
+
+    def _detect_domain(self) -> str:
+        """Extract production domain/URL from .env, wp-config.php, or similar config files."""
+        # Candidate paths to search (project root + common web root locations)
+        search_roots = [self.project_root]
+        for subdir in ('public_html', 'restore/public_html', 'web', 'html', 'www'):
+            p = self.project_root / subdir
+            if p.is_dir():
+                search_roots.append(p)
+
+        # 1. .env files — look for URL keys first, then derive from email domain
+        for root in search_roots:
+            env_path = root / '.env'
+            if not env_path.exists():
+                continue
+            try:
+                env = env_path.read_text(encoding='utf-8', errors='replace')
+                # Explicit URL keys
+                m = re.search(
+                    r'(?:APP_URL|SITE_URL|WP_HOME|WP_SITEURL|BASE_URL|APP_DOMAIN)\s*=\s*["\']?(https?://[^\s"\']+)',
+                    env, re.IGNORECASE
+                )
+                if m:
+                    return m.group(1).rstrip('/')
+                # Derive from email address (e.g. MAIL_FROM_ADDRESS=no-reply@example.com)
+                m = re.search(
+                    r'MAIL_(?:FROM_ADDRESS|USERNAME)\s*=\s*["\']?[^@\s"\']+@([a-z0-9.-]+\.[a-z]{2,})',
+                    env, re.IGNORECASE
+                )
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+
+        # 2. wp-config.php — WP_HOME / WP_SITEURL
+        for root in search_roots:
+            wpcfg = root / 'wp-config.php'
+            if not wpcfg.exists():
+                continue
+            try:
+                raw = wpcfg.read_text(encoding='utf-8', errors='replace')[:4000]
+                # Strip commented lines so a stale `// define('WP_HOME', ...)` is ignored
+                content = '\n'.join(
+                    l for l in raw.splitlines()
+                    if not l.lstrip().startswith(('//', '#'))
+                )
+                m = re.search(
+                    r"define\s*\(\s*['\"]WP_(?:HOME|SITEURL)['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+                    content
+                )
+                if m:
+                    return m.group(1).rstrip('/')
+            except Exception:
+                pass
+
+        return ''
+
+    def _detect_platform(self, tracked_paths: list) -> str:
+        """Identify CMS or framework from tracked file paths and known marker files."""
+        paths_str = ' '.join(tracked_paths)
+
+        # Optional in-house platform, configured out-of-band so an organisation's
+        # internal CMS name and its directory fingerprint stay out of this repo
+        # (which has a public mirror). Set BOTH to enable:
+        #   CODE_INDEX_CUSTOM_PLATFORM  label to report, e.g. 'Acme CMS'
+        #   CODE_INDEX_CUSTOM_MARKER    identifying path fragment, forward-slash
+        #                               normalised, e.g. 'sources/init/'
+        # Checked first so an in-house platform wins over the generic markers
+        # below. If either is unset the check is skipped entirely.
+        custom_label = os.environ.get('CODE_INDEX_CUSTOM_PLATFORM', '').strip()
+        custom_marker = os.environ.get('CODE_INDEX_CUSTOM_MARKER', '').strip()
+        if custom_label and custom_marker and custom_marker in paths_str:
+            return custom_label
+
+        # WordPress
+        if any('wp-content/' in p for p in tracked_paths):
+            return 'WordPress'
+        for subdir in ('', 'public_html/', 'restore/public_html/'):
+            if (self.project_root / subdir / 'wp-config.php').exists():
+                return 'WordPress'
+
+        # Common frameworks via marker files
+        markers = {
+            'artisan': 'Laravel',
+            'manage.py': 'Django',
+            'next.config.js': 'Next.js',
+            'next.config.ts': 'Next.js',
+            'nuxt.config.js': 'Nuxt.js',
+            'nuxt.config.ts': 'Nuxt.js',
+            'svelte.config.js': 'SvelteKit',
+            'astro.config.mjs': 'Astro',
+        }
+        for marker, label in markers.items():
+            if (self.project_root / marker).exists():
+                return label
+
+        return ''
+
+    def _detect_web_root(self) -> str:
+        """Find the subdirectory containing the actual site files."""
+        for subdir in ('public_html', 'restore/public_html', 'web', 'html', 'www', 'htdocs', 'webroot'):
+            p = self.project_root / subdir
+            if p.is_dir() and any((p / f).exists() for f in ('index.php', 'wp-config.php', 'index.html')):
+                return subdir
+        return ''
+
+    def _detect_local_dev_url(self) -> str:
+        """Find local dev URL from docker-compose port mapping."""
+        for dc_path in (
+            self.project_root / 'docker' / 'docker-compose.yml',
+            self.project_root / 'docker-compose.yml',
+            self.project_root / 'docker' / 'docker-compose.yaml',
+            self.project_root / 'docker-compose.yaml',
+        ):
+            if not dc_path.exists():
+                continue
+            try:
+                content = dc_path.read_text(encoding='utf-8', errors='replace')
+                m = re.search(r'^\s*-?\s*["\']?(\d{3,5}):(?:80|443)["\']?', content, re.MULTILINE)
+                if m:
+                    scheme = 'https' if ':443' in m.group(0) else 'http'
+                    return f'{scheme}://localhost:{m.group(1)}'
+            except Exception:
+                pass
+        return ''
+
+    def _detect_php_version(self) -> str:
+        """Detect PHP version from .php-version, Dockerfile, or composer.json."""
+
+        pv = self.project_root / '.php-version'
+        if pv.exists():
+            try:
+                return pv.read_text(encoding='utf-8').strip()
+            except Exception:
+                pass
+
+        for df in (self.project_root / 'docker' / 'Dockerfile', self.project_root / 'Dockerfile'):
+            if df.exists():
+                try:
+                    content = df.read_text(encoding='utf-8', errors='replace')[:500]
+                    m = re.search(r'FROM\s+php:(\d+\.\d+)', content, re.IGNORECASE)
+                    if m:
+                        return m.group(1)
+                except Exception:
+                    pass
+
+        search_roots = [self.project_root]
+        for sub in ('public_html', 'restore/public_html'):
+            p = self.project_root / sub
+            if p.is_dir():
+                search_roots.append(p)
+        for root in search_roots:
+            composer = root / 'composer.json'
+            if composer.exists():
+                try:
+                    data = json.loads(composer.read_text(encoding='utf-8'))
+                    php_req = data.get('require', {}).get('php', '')
+                    if php_req:
+                        m = re.search(r'(\d+\.\d+)', php_req)
+                        if m:
+                            return m.group(1) + '+'
+                except Exception:
+                    pass
+
+        return ''
+
+    def _detect_db_name(self) -> str:
+        """Extract database name from .env."""
+        search_roots = [self.project_root]
+        for sub in ('public_html', 'restore/public_html'):
+            p = self.project_root / sub
+            if p.is_dir():
+                search_roots.append(p)
+        for root in search_roots:
+            env_path = root / '.env'
+            if env_path.exists():
+                try:
+                    env = env_path.read_text(encoding='utf-8', errors='replace')
+                    m = re.search(
+                        r'(?:DB_NAME|DATABASE_NAME|MYSQL_DATABASE|MARIADB_DATABASE)\s*=\s*["\']?([^\s"\']+)',
+                        env, re.IGNORECASE
+                    )
+                    if m:
+                        return m.group(1)
+                except Exception:
+                    pass
+        return ''
+
+    def _detect_cache_layers(self, tracked_paths: list) -> list:
+        """Identify WordPress cache/CDN plugins from tracked file paths."""
+        CACHE_PLUGINS = {
+            'wp-rocket': 'WP Rocket',
+            'w3-total-cache': 'W3 Total Cache',
+            'sucuri-scanner': 'Sucuri',
+            'litespeed-cache': 'LiteSpeed Cache',
+            'wp-super-cache': 'WP Super Cache',
+            'wp-fastest-cache': 'WP Fastest Cache',
+            'breeze': 'Breeze (Cloudways)',
+            'wp-cloudflare-page-cache': 'Cloudflare Page Cache',
+            'autoptimize': 'Autoptimize',
+            'sg-cachepress': 'SG Optimizer',
+            'endurance-page-cache': 'Endurance Page Cache',
+        }
+        paths_str = ' '.join(tracked_paths)
+        return [name for slug, name in CACHE_PLUGINS.items()
+                if f'wp-content/plugins/{slug}/' in paths_str]
+
+    def _detect_wp_theme(self, tracked_paths: list) -> str:
+        """Identify non-default WordPress theme(s) from tracked paths and filesystem."""
+        DEFAULT_THEMES = {
+            'twentytwenty', 'twentytwentyone', 'twentytwentytwo', 'twentytwentythree',
+            'twentytwentyfour', 'twentytwentyfive', 'twentynineteen', 'twentyeighteen',
+            'twentyseventeen', 'twentysixteen', 'twentyfifteen',
+        }
+        themes = set()
+
+        for path in tracked_paths:
+            parts = path.split('/')
+            for i, part in enumerate(parts):
+                if (part == 'themes' and i > 0 and parts[i - 1] == 'wp-content'
+                        and i + 1 < len(parts) and parts[i + 1] not in DEFAULT_THEMES):
+                    themes.add(parts[i + 1])
+
+        theme_dirs = [self.project_root / 'wp-content' / 'themes']
+        for sub in ('public_html', 'restore/public_html'):
+            theme_dirs.append(self.project_root / sub / 'wp-content' / 'themes')
+        for themes_dir in theme_dirs:
+            if themes_dir.is_dir():
+                try:
+                    for td in themes_dir.iterdir():
+                        if td.is_dir() and td.name not in DEFAULT_THEMES and not td.name.startswith('.'):
+                            themes.add(td.name)
+                except Exception:
+                    pass
+
+        return ', '.join(sorted(themes)) if themes else ''
+
+    def _generate_project_summary(self, has_meaningful_changes: bool = True):
+        """Write .code_index/PROJECT_SUMMARY.md with static analysis + Haiku description."""
+        import datetime
+        from collections import Counter
+
+        if not has_meaningful_changes:
+            return
+
+        project_name = self.project_root.name
+        summary_path = self.index_dir / 'PROJECT_SUMMARY.md'
+
+        EXT_TO_LANG = {
+            '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
+            '.jsx': 'JSX', '.tsx': 'TSX', '.php': 'PHP', '.rb': 'Ruby',
+            '.go': 'Go', '.rs': 'Rust', '.java': 'Java', '.cs': 'C#',
+            '.cpp': 'C++', '.c': 'C', '.swift': 'Swift', '.kt': 'Kotlin',
+            '.html': 'HTML', '.css': 'CSS', '.scss': 'SCSS', '.sass': 'Sass',
+            '.sql': 'SQL', '.sh': 'Shell', '.ps1': 'PowerShell',
+            '.lua': 'Lua', '.vue': 'Vue', '.svelte': 'Svelte', '.astro': 'Astro',
+        }
+
+        tracked = {}
+        ext_counts = Counter()
+        try:
+            tracked = self.db.get_all_file_tracking()
+            for fpath, info in tracked.items():
+                if not info.get('skipped'):
+                    ext = Path(fpath).suffix.lower()
+                    if ext:
+                        ext_counts[ext] += 1
+        except Exception:
+            pass
+
+        languages = []
+        for ext, count in ext_counts.most_common(8):
+            lang = EXT_TO_LANG.get(ext, ext.lstrip('.').upper())
+            languages.append(f"{lang} ({count})")
+
+        skip_names = {'node_modules', '__pycache__', 'vendor', '.git', '.code_index',
+                      'dist', 'build', 'out', '.next', '.nuxt', 'uploads',
+                      'wp-admin', 'wp-includes'}
+        top_items = []
+        try:
+            for item in sorted(self.project_root.iterdir()):
+                if item.name in skip_names or item.name.startswith('.'):
+                    continue
+                top_items.append(item.name + ('/' if item.is_dir() else ''))
+        except Exception:
+            pass
+
+        # --- Static facts (always accurate — not LLM-generated) ---
+        tracked_paths = list(tracked.keys())
+        detected_domain = self._detect_domain()
+        platform = self._detect_platform(tracked_paths)
+        web_root = self._detect_web_root()
+        local_dev_url = self._detect_local_dev_url()
+        php_version = self._detect_php_version()
+        db_name = self._detect_db_name()
+        cache_layers = self._detect_cache_layers(tracked_paths)
+        wp_theme = self._detect_wp_theme(tracked_paths)
+
+        # --- Context files for LLM ---
+        config_snippets = []
+        for fname in ('package.json', 'composer.json', 'pyproject.toml',
+                      'go.mod', 'requirements.txt', 'Cargo.toml', 'Gemfile'):
+            fpath = self.project_root / fname
+            if fpath.exists():
+                try:
+                    content = fpath.read_text(encoding='utf-8', errors='replace')[:600]
+                    config_snippets.append(f"=== {fname} ===\n{content}")
+                except Exception:
+                    pass
+
+        readme_content = ''
+        for name in ('README.md', 'readme.md', 'README.txt', 'README'):
+            rpath = self.project_root / name
+            if rpath.exists():
+                try:
+                    readme_content = rpath.read_text(encoding='utf-8', errors='replace')[:2000]
+                except Exception:
+                    pass
+                break
+
+        # Project-local CLAUDE.md (not the global one) carries useful context
+        project_claude_md = ''
+        for claude_path in (self.project_root / 'CLAUDE.md',
+                             self.project_root / '.claude' / 'CLAUDE.md'):
+            if claude_path.exists():
+                try:
+                    project_claude_md = claude_path.read_text(encoding='utf-8', errors='replace')[:1500]
+                except Exception:
+                    pass
+                break
+
+        # --- LLM-generated sections ---
+        llm_output = ''
+        try:
+            import anthropic
+            api_key = os.environ.get('ANTHROPIC_API_KEY')
+            if api_key:
+                context = f"Project folder name: {project_name}\n"
+                if detected_domain:
+                    context += f"Production domain/URL: {detected_domain}\n"
+                if platform:
+                    context += f"CMS/Platform: {platform}\n"
+                if web_root:
+                    context += f"Web root: {web_root}/\n"
+                if php_version:
+                    context += f"PHP version: {php_version}\n"
+                if db_name:
+                    context += f"Database: {db_name}\n"
+                if cache_layers:
+                    context += f"Cache layers: {', '.join(cache_layers)}\n"
+                if wp_theme:
+                    context += f"WordPress theme: {wp_theme}\n"
+                if languages:
+                    context += f"Languages: {', '.join(languages)}\n"
+                if top_items:
+                    context += "Top-level structure:\n" + '\n'.join(f"  {i}" for i in top_items[:20]) + '\n'
+                for snippet in config_snippets:
+                    context += f"\n{snippet}\n"
+                if readme_content:
+                    context += f"\nREADME:\n{readme_content}\n"
+                if project_claude_md:
+                    context += f"\nProject CLAUDE.md:\n{project_claude_md}\n"
+
+                prompt = (
+                    "Analyze this project and write three markdown sections.\n"
+                    "Use the domain, platform, and CLAUDE.md to be specific — avoid generic descriptions.\n\n"
+                    "## Purpose\n"
+                    "1-2 sentences describing the site/app and its production domain if known. "
+                    "Name the site by its actual name, not the folder name.\n\n"
+                    "## Frameworks & Tools\n"
+                    "Bullet list of key frameworks, libraries, and build tools. "
+                    "If the CMS/platform is known, name it explicitly.\n\n"
+                    "## Special Considerations\n"
+                    "Bullet list of anything a developer must know before touching this code: "
+                    "deployment quirks, known fragile areas, auth patterns, external service dependencies, "
+                    "things that have broken before (from CLAUDE.md if present). "
+                    "Omit this section entirely if there is nothing notable.\n\n"
+                    "Be terse. No intro or closing text. Only what's genuinely useful.\n\n"
+                    f"---\n{context}"
+                )
+
+                client = anthropic.Anthropic(api_key=api_key)
+                response = client.messages.create(
+                    model='claude-haiku-4-5-20251001',
+                    max_tokens=600,
+                    messages=[{'role': 'user', 'content': prompt}],
+                )
+                llm_output = response.content[0].text.strip()
+        except Exception:
+            pass
+
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+        lines = [
+            f"# {project_name}",
+            "",
+            f"> Auto-generated by code-index · {timestamp}",
+            "",
+        ]
+
+        if detected_domain:
+            lines += [f"**Domain:** {detected_domain}", ""]
+        if platform:
+            lines += [f"**Platform:** {platform}", ""]
+
+        env_items = []
+        if web_root:
+            env_items.append(f"- **Web root:** `{web_root}/`")
+        if local_dev_url:
+            env_items.append(f"- **Local dev:** {local_dev_url}")
+        if php_version:
+            env_items.append(f"- **PHP:** {php_version}")
+        if db_name:
+            env_items.append(f"- **Database:** `{db_name}`")
+        if cache_layers:
+            env_items.append(f"- **Cache layers:** {', '.join(cache_layers)}")
+        if wp_theme:
+            env_items.append(f"- **Theme:** `{wp_theme}`")
+        if env_items:
+            lines += ["## Environment"] + env_items + [""]
+
+        lines += [
+            "## Languages",
+            ', '.join(languages) if languages else '_not detected_',
+            "",
+            "## Structure",
+            "```",
+            *top_items[:20],
+            "```",
+            "",
+        ]
+
+        if llm_output:
+            lines.append(llm_output)
+        else:
+            lines.append("_LLM description unavailable — set ANTHROPIC_API_KEY to enable._")
+
+        try:
+            summary_path.write_text('\n'.join(lines), encoding='utf-8')
+        except Exception:
+            pass
 
     def close(self):
         if self._db:

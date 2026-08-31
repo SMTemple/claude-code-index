@@ -643,6 +643,25 @@ class CodeIndexDB:
 
     def close(self):
         try:
+            # Flush the write-ahead log back into the main DB before closing.
+            # Short-lived reindex processes otherwise append to the WAL and exit
+            # without checkpointing, so it grows unbounded. A bloated WAL forces
+            # every reader (incl. the long-lived MCP server connections) to scan
+            # it on each query, which surfaces as DB "locking"/slow searches.
+            #
+            # PASSIVE (not TRUNCATE/FULL): never blocks on an active reader. A
+            # TRUNCATE checkpoint waits up to busy_timeout (30s) for the MCP
+            # server's read connections to release the WAL, which could stall
+            # process exit; it also silently no-ops if a reader is mid-query.
+            # PASSIVE always flushes the committed frames it can and lets the
+            # WAL reset/reuse in place, keeping it bounded without the hang risk.
+            # Serialized under _write_lock so it can't race an in-flight write
+            # on the shared self.conn.
+            try:
+                with self._write_lock:
+                    self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception:
+                pass
             self.conn.close()
         except Exception:
             pass

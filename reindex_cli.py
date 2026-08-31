@@ -14,6 +14,25 @@ import sys
 import shutil
 import time
 
+# Force UTF-8 on stdout/stderr so non-ASCII filenames (or any unicode in
+# progress detail) don't crash the indexer on Windows consoles that default
+# to cp1252. errors='replace' degrades gracefully if a glyph still can't
+# be rendered, rather than aborting a long-running reindex.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
+
+# Cap OpenBLAS's per-thread working buffers before numpy is imported. numpy
+# reserves ~32 MB per thread at import time, so on a 12-core box `import numpy`
+# alone costs ~394 MB vs ~40 MB at one thread. A background reindex can run
+# alongside several Claude Code sessions, so that reservation is pure waste:
+# embedding is done by ONNX Runtime, not BLAS. Measured throughput is if
+# anything better at one thread (30 vs 26 chunks/s). Matches the cap in
+# code_index_server.py; export OPENBLAS_NUM_THREADS yourself to override.
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+
 # Ensure the code_index package is importable
 SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SERVER_DIR)
@@ -155,8 +174,11 @@ def main():
 
     # Quiet mode: no GUI, no terminal output — used by background hooks
     if quiet:
-        indexer.force_reindex(full=full)
-        indexer.close()
+        try:
+            indexer.force_reindex(full=full)
+        finally:
+            # close() checkpoints+truncates the WAL — must run even on error
+            indexer.close()
         return
 
     mode = 'Full' if full else 'Incremental'

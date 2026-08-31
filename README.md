@@ -145,7 +145,7 @@ Merge these into your existing `settings.json`. If you don't have one, create it
         "hooks": [
           {
             "type": "command",
-            "command": "touch /tmp/.claude-reindex-needed",
+            "command": "touch \"/tmp/.claude-reindex-needed.$(echo \"$PWD\" | md5sum | cut -d' ' -f1)\"",
             "timeout": 5,
             "async": true
           }
@@ -169,7 +169,19 @@ Merge these into your existing `settings.json`. If you don't have one, create it
         "hooks": [
           {
             "type": "command",
-            "command": "rm -f /tmp/.claude-codeindex-used; if [ -f \"$PWD/.code_index/code_index.db\" ] && [ -f /tmp/.claude-reindex-needed ]; then rm /tmp/.claude-reindex-needed && python \"$HOME/.claude/tools/code-indexer/reindex_cli.py\" --quiet > /dev/null 2>&1 & disown && echo '[code-index] Background reindex started.'; fi",
+            "command": "rm -f /tmp/.claude-codeindex-used",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FLAG=\"/tmp/.claude-reindex-needed.$(echo \"$PWD\" | md5sum | cut -d' ' -f1)\"; if [ -f \"$PWD/.code_index/code_index.db\" ] && [ -f \"$FLAG\" ]; then rm \"$FLAG\" && python \"$HOME/.claude/tools/code-indexer/reindex_cli.py\" --quiet > /dev/null 2>&1 & disown; fi",
             "timeout": 5
           }
         ]
@@ -185,11 +197,12 @@ Merge these into your existing `settings.json`. If you don't have one, create it
 |---|---|
 | PreToolUse on `mcp__code-index__reindex` | Blocks Claude from calling reindex directly — forces it to run via Bash with `run_in_background: true` so the conversation doesn't stall |
 | PreToolUse on `Read\|Grep\|Glob` | Gentle nudge toward code-index tools for broad searches. Only fires if you haven't used the index yet this session |
-| PostToolUse on `Edit\|Write` | Drops a flag so the next prompt knows to reindex |
+| PostToolUse on `Edit\|Write` | Drops a per-project flag (`/tmp/.claude-reindex-needed.<md5 of $PWD>`) so end-of-turn knows to reindex |
 | PostToolUse on `mcp__code-index__search_*` | Marks the index as used, silences the reminder hook |
-| UserPromptSubmit | Clears the used-flag, kicks off a background reindex if files changed. Never blocks |
+| UserPromptSubmit | Clears the used-flag. Never blocks |
+| Stop (end of turn) | Kicks off a background incremental reindex if the per-project flag is set and the cwd has `.code_index/code_index.db`. Never blocks |
 
-> **Important:** if you used the venv route in Step 1, replace `python` in the UserPromptSubmit command with the full path to your venv Python (e.g. `$HOME/.claude-code-index-venv/bin/python`).
+> **Important:** if you used the venv route in Step 1, replace `python` in the Stop hook command with the full path to your venv Python (e.g. `$HOME/.claude-code-index-venv/bin/python`).
 
 ---
 
@@ -409,6 +422,54 @@ claude-code-index/
 - First index build: 10–60 seconds depending on project size
 - Incremental reindex: milliseconds to seconds (mtime + content hash comparison)
 - Full reindex on large projects (1000+ files): 2–3 minutes
+
+### Memory footprint
+
+Claude Code spawns **one MCP server per session**, so this server's resident
+size is multiplied by however many sessions you run at once. Defaults are tuned
+for that:
+
+| State | Private memory |
+|---|---|
+| Idle (model not yet loaded) | ~88 MB |
+| After the first semantic search | ~215 MB |
+
+Two settings keep it there. Both were measured on a 12-core Windows box; the
+server previously used **569 MB** per session.
+
+**`OPENBLAS_NUM_THREADS`** (default `1`) — numpy's bundled OpenBLAS reserves
+roughly 32 MB of per-thread working buffer at import time, so `import numpy`
+alone costs ~394 MB at 12 threads:
+
+| `OPENBLAS_NUM_THREADS` | `import numpy` cost |
+|---|---|
+| unset (= core count) | +394 MB |
+| 4 | +136 MB |
+| 2 | +72 MB |
+| **1 (default here)** | **+40 MB** |
+
+Embedding runs through ONNX Runtime, not BLAS — numpy only handles 384-dim
+vectors — so capping it costs nothing. Measured throughput is if anything
+slightly better at one thread (30 vs 26 chunks/s) from reduced contention.
+Set the variable yourself before launching to override.
+
+**`CODE_INDEX_PREWARM`** (default off) — set to `1` to load the embedding model
+eagerly at startup instead of on first use. Eager loading costs ~128 MB whether
+or not the session ever searches; the fastembed/ONNX backend loads in ~1.4s, so
+the lazy default simply makes the first search take ~1.4s and every later one
+~0.02s. Worth enabling only ahead of a large batch reindex.
+
+### Other environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CODE_INDEX_PROJECT_ROOT` | cwd | Which project to index (required under Cursor) |
+| `CODE_INDEX_BACKEND` | auto | Force `fastembed` or `sentence_transformers` |
+| `CODE_INDEX_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Embedding model |
+| `CODE_INDEX_BATCH_SIZE` | `256` | Chunks per encode pass |
+| `CODE_INDEX_MODEL_TIMEOUT` | `180` | Seconds allowed for model load |
+| `CODE_INDEX_EMBED_TIMEOUT` | `600` | Seconds allowed for one embed batch |
+| `FASTEMBED_CACHE_PATH` | `.model_cache/` | Where the ONNX model is cached |
 
 ---
 
